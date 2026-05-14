@@ -1,4 +1,13 @@
+#include "imgui/imgui.h"
+#include "imgui/imgui_impl_glfw.h"
+#include "imgui/imgui_impl_opengl3.h"
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+#include "calendar.h"
 #include <cstdio>
+#define GL_SILENCE_DEPRECATION
+#include <OpenGL/gl3.h>
+#include <GLFW/glfw3.h>
 #include <fstream>
 #include <string>
 #include <cstring>
@@ -8,25 +17,9 @@
 #include <sstream>
 #include <cstdint>
 #include <filesystem>
-#include <algorithm>
-#include <thread>
-#include <mutex>
-
-#define GL_SILENCE_DEPRECATION
-#include <OpenGL/gl3.h>
-#include <GLFW/glfw3.h>
-
-#include "imgui/imgui.h"
-#include "imgui/imgui_impl_glfw.h"
-#include "imgui/imgui_impl_opengl3.h"
-#define STB_IMAGE_IMPLEMENTATION
-#include "stb_image.h"
-#include "calendar.h"
 
 // Forward declarations
 void syncAndSaveCurrentEvent();
-std::string SerializeCalendarTask(const CalendarTask &task);
-CalendarTask DeserializeCalendarTask(const std::string &data);
 
 std::string NormalizeDate(const std::string &input)
 {
@@ -55,117 +48,6 @@ std::string NormalizeDate(const std::string &input)
     }
 
     return input; // fallback if parsing fails
-}
-
-static std::string NormalizeLabel(const std::string &text)
-{
-    std::string out;
-    for (char c : text)
-    {
-        if (std::isalnum((unsigned char)c) || c == ' ')
-            out.push_back((char)std::tolower((unsigned char)c));
-        else
-            out.push_back(' ');
-    }
-
-    std::string normalized;
-    bool lastSpace = false;
-    for (char c : out)
-    {
-        if (c == ' ')
-        {
-            if (lastSpace)
-                continue;
-            lastSpace = true;
-        }
-        else
-        {
-            lastSpace = false;
-        }
-        normalized.push_back(c);
-    }
-
-    if (!normalized.empty() && normalized.back() == ' ')
-        normalized.pop_back();
-
-    return normalized;
-}
-
-static bool CategoryMatchesTask(const std::string &taskLabel, const std::string &categoryLabel)
-{
-    std::string taskNorm = NormalizeLabel(taskLabel);
-    std::string categoryNorm = NormalizeLabel(categoryLabel);
-
-    if (taskNorm == categoryNorm)
-        return true;
-
-    if (!taskNorm.empty() && taskNorm.find(categoryNorm) != std::string::npos)
-        return true;
-
-    if (!categoryNorm.empty() && categoryNorm.find(taskNorm) != std::string::npos)
-        return true;
-
-    static const std::vector<std::pair<std::string, std::string>> aliases = {
-        {"sound system", "dj soundsystem"},
-        {"sound system", "soundsystem"},
-        {"catering", "catering food drinks"},
-        {"food drinks", "catering food drinks"},
-        {"party favors", "favors giveaways"},
-        {"favors", "favors giveaways"},
-        {"dj sound", "dj soundsystem"},
-        {"dj", "dj soundsystem"},
-        {"cake", "cake"},
-        {"photographer", "photographer"},
-        {"videography", "videography"},
-        {"decor upgrade", "decor upgrade"},
-        {"activities games", "activities games"},
-        {"entertainment dj games", "entertainment"},
-        {"dj soundsystem", "dj sound"}
-    };
-
-    for (auto &pair : aliases)
-    {
-        if ((taskNorm == pair.first && categoryNorm == pair.second) ||
-            (taskNorm == pair.second && categoryNorm == pair.first))
-        {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-static float CalculateCompletedBudgetPercent(const std::vector<std::string> &tasks, const std::vector<bool> &done,
-    const std::vector<std::pair<std::string, float>> &allocation)
-{
-    if (tasks.empty() || tasks.size() != done.size())
-        return 0.0f;
-
-    float completedPercent = 0.0f;
-    std::vector<bool> categoryMarked(allocation.size(), false);
-
-    for (size_t taskIndex = 0; taskIndex < tasks.size(); ++taskIndex)
-    {
-        if (!done[taskIndex])
-            continue;
-
-        for (size_t catIndex = 0; catIndex < allocation.size(); ++catIndex)
-        {
-            if (categoryMarked[catIndex])
-                continue;
-
-            if (CategoryMatchesTask(tasks[taskIndex], allocation[catIndex].first))
-                categoryMarked[catIndex] = true;
-        }
-    }
-
-    for (size_t catIndex = 0; catIndex < allocation.size(); ++catIndex)
-    {
-        if (categoryMarked[catIndex])
-            completedPercent += allocation[catIndex].second;
-    }
-
-    return std::min(completedPercent, 100.0f);
 }
 
 int DaysUntilEvent(const char *dateText)
@@ -216,109 +98,39 @@ int DaysUntilEvent(const char *dateText)
     return (int)std::ceil(diff / (60.0 * 60.0 * 24.0));
 }
 
+enum class EventType
+{
+    None,
+    Party,
+    Wedding,
+    Birthday,
+    Conference,
+    Engagement
+};
 EventType selectedEvent = EventType::None;
+
+struct Event {
+    std::string name;
+    std::string date;
+    std::string location;
+    float budget;
+    std::string guestList;
+    std::vector<std::string> tasks;
+    std::vector<bool> taskCompleted;
+    std::string notes;
+    EventType type;
+    int selectedOption;
+};
 
 std::vector<Event> savedEvents;
 Event *currentEvent = nullptr;
 std::vector<std::string> currentEventTasks;
-std::string currentUsername = "";
 
 ////////////////////////////////////////////////////////////
 // PUT ALL VARIABLES HERE
 ////////////////////////////////////////////////////////////
 // ===== CALENDAR STATE =====
 CalendarState calendarState;
-
-// ===== CHATBOT STATE =====
-struct ChatMessage {
-    std::string role; // "user" or "assistant"
-    std::string content;
-};
-std::vector<ChatMessage> chatHistory;
-static char chatInputBuffer[512] = "";
-static bool chatWaitingForResponse = false;
-static std::string chatCurrentResponse = "";
-static std::mutex chatMutex;
-
-static std::string EscapeChatText(const std::string &text)
-{
-    std::string escaped;
-    escaped.reserve(text.size());
-    for (char c : text)
-    {
-        if (c == '\\') escaped += "\\\\";
-        else if (c == '\n') escaped += "\\n";
-        else if (c == '|') escaped += "\\|";
-        else escaped.push_back(c);
-    }
-    return escaped;
-}
-
-static std::string UnescapeChatText(const std::string &text)
-{
-    std::string result;
-    result.reserve(text.size());
-    for (size_t i = 0; i < text.size(); ++i)
-    {
-        if (text[i] == '\\' && i + 1 < text.size())
-        {
-            char next = text[i + 1];
-            if (next == 'n')
-            {
-                result += '\n';
-                ++i;
-            }
-            else if (next == '|')
-            {
-                result += '|';
-                ++i;
-            }
-            else if (next == '\\')
-            {
-                result += '\\';
-                ++i;
-            }
-            else
-            {
-                result += text[i];
-            }
-        }
-        else
-        {
-            result += text[i];
-        }
-    }
-    return result;
-}
-
-static void SaveChatHistory()
-{
-    std::ofstream file("chat_history.txt");
-    if (!file)
-        return;
-    for (const auto &msg : chatHistory)
-    {
-        file << msg.role << "|" << EscapeChatText(msg.content) << "\n";
-    }
-}
-
-static void LoadChatHistory()
-{
-    std::ifstream file("chat_history.txt");
-    if (!file)
-        return;
-    std::string line;
-    while (std::getline(file, line))
-    {
-        auto separator = line.find('|');
-        if (separator == std::string::npos)
-            continue;
-        ChatMessage msg;
-        msg.role = line.substr(0, separator);
-        msg.content = UnescapeChatText(line.substr(separator + 1));
-        chatHistory.push_back(msg);
-    }
-}
 
 // ===== TASK TRACKING =====
 std::vector<bool> taskDone;
@@ -327,10 +139,6 @@ static std::vector<int> taskDaysLeft;
 // ===== BUDGET =====
 static float totalBudget = 10000.0f;
 static float spentBudget = 0.0f;
-static int budgetInputOption = 0;
-static bool budgetInputLocked = false;
-static float budgetSpentOption1 = 0.0f;
-static float budgetSpentOption2 = 0.0f;
 // ---------------- BIRTHDAY ----------------
 
 char birthdayTheme[100] = "";
@@ -619,16 +427,6 @@ std::string budgetRangeText = "";
 // Shared event detail fields
 const std::vector<const char *> *currentChecklistTasks = nullptr;
 std::vector<std::string> *currentDynamicTasks = nullptr;
-static std::vector<std::string> chatbotGeneratedTasks;
-static std::vector<std::pair<std::string, std::string>> chatbotConversation;
-static char chatbotPrompt[512] = "Ask the assistant anything about your event, schedule, tasks, or planning...";
-static char chatbotResponseBuffer[2048] = "";
-static std::string chatbotResponse;
-static char chatbotProvider[32] = "ollama";
-static char chatbotOllamaModel[64] = "llama2";
-static char chatbotOllamaPath[256] = "/opt/homebrew/bin/ollama";
-static char chatbotGroqApiKey[256] = "";
-static char chatbotGroqModel[64] = "groq2o";
 char selectedEventDate[50] = "";
 char selectedEventLocation[100] = "";
 char selectedEventGuests[50] = "";
@@ -667,14 +465,6 @@ void ResetEventOptionState()
     selectedOptionName.clear();
 }
 
-void ClearSelectedEventDetailFields()
-{
-    selectedEventName[0] = '\0';
-    selectedEventDate[0] = '\0';
-    selectedEventLocation[0] = '\0';
-    selectedEventGuests[0] = '\0';
-}
-
 void SetOptionBudgetRange()
 {
     if (selectedEvent == EventType::Birthday && selectedBirthdayOption != BirthdayOption::None)
@@ -687,29 +477,29 @@ void SetOptionBudgetRange()
                 budgetRangeText = "Recommended budget: 7,000 - 9,000 EGP";
                 break;
             case BirthdayOption::Option2:
-                birthdayMinBudget = 9000.0f;
+                birthdayMinBudget = 11000.0f;
                 birthdayMaxBudget = 13000.0f;
-                budgetRangeText = "Recommended budget: 9,000 - 13,000 EGP";
+                budgetRangeText = "Recommended budget: 11,000 - 13,000 EGP";
                 break;
             case BirthdayOption::Option3:
-                birthdayMinBudget = 13000.0f;
+                birthdayMinBudget = 16000.0f;
                 birthdayMaxBudget = 20000.0f;
-                budgetRangeText = "Recommended budget: 13,000 - 20,000 EGP";
+                budgetRangeText = "Recommended budget: 16,000 - 20,000 EGP";
                 break;
             case BirthdayOption::Option4:
-                birthdayMinBudget = 20000.0f;
+                birthdayMinBudget = 25000.0f;
                 birthdayMaxBudget = 31000.0f;
-                budgetRangeText = "Recommended budget: 20,000 - 31,000 EGP";
+                budgetRangeText = "Recommended budget: 25,000 - 31,000 EGP";
                 break;
             case BirthdayOption::Option5:
-                birthdayMinBudget = 31000.0f;
+                birthdayMinBudget = 39000.0f;
                 birthdayMaxBudget = 45000.0f;
-                budgetRangeText = "Recommended budget: 31,000 - 45,000 EGP";
+                budgetRangeText = "Recommended budget: 39,000 - 45,000 EGP";
                 break;
             case BirthdayOption::Option6:
-                birthdayMinBudget = 45000.0f;
+                birthdayMinBudget = 54000.0f;
                 birthdayMaxBudget = 66000.0f;
-                budgetRangeText = "Recommended budget: 45,000 - 66,000 EGP";
+                budgetRangeText = "Recommended budget: 54,000 - 66,000 EGP";
                 break;
             default:
                 break;
@@ -720,29 +510,29 @@ void SetOptionBudgetRange()
         switch (selectedWeddingOption)
         {
             case WeddingOption::Option1:
-                weddingMinBudget = 6000000.0f;
+                weddingMinBudget = 9000000.0f;
                 weddingMaxBudget = 11000000.0f;
-                budgetRangeText = "Recommended budget: 6,000,000 - 11,000,000 EGP";
+                budgetRangeText = "Recommended budget: 9,000,000 - 11,000,000 EGP";
                 break;
             case WeddingOption::Option2:
-                weddingMinBudget = 3300000.0f;
+                weddingMinBudget = 5000000.0f;
                 weddingMaxBudget = 6000000.0f;
-                budgetRangeText = "Recommended budget: 3,300,000 - 6,000,000 EGP";
+                budgetRangeText = "Recommended budget: 5,000,000 - 6,000,000 EGP";
                 break;
             case WeddingOption::Option3:
-                weddingMinBudget = 1650000.0f;
+                weddingMinBudget = 2700000.0f;
                 weddingMaxBudget = 3300000.0f;
-                budgetRangeText = "Recommended budget: 1,650,000 - 3,300,000 EGP";
+                budgetRangeText = "Recommended budget: 2,700,000 - 3,300,000 EGP";
                 break;
             case WeddingOption::Option4:
-                weddingMinBudget = 880000.0f;
+                weddingMinBudget = 1350000.0f;
                 weddingMaxBudget = 1650000.0f;
-                budgetRangeText = "Recommended budget: 880,000 - 1,650,000 EGP";
+                budgetRangeText = "Recommended budget: 1,350,000 - 1,650,000 EGP";
                 break;
             case WeddingOption::Option5:
-                weddingMinBudget = 165000.0f;
+                weddingMinBudget = 720000.0f;
                 weddingMaxBudget = 880000.0f;
-                budgetRangeText = "Recommended budget: 165,000 - 880,000 EGP";
+                budgetRangeText = "Recommended budget: 720,000 - 880,000 EGP";
                 break;
             case WeddingOption::Option6:
                 weddingMinBudget = 135000.0f;
@@ -764,28 +554,23 @@ void SetOptionBudgetRange()
                 break;
             case PartyOption::Option2:
                 partyMinBudget = 10000.0f;
-                partyMaxBudget = 15000.0f;
-                budgetRangeText = "Recommended budget: 10,000 - 15,000 EGP";
+                partyMaxBudget = 14000.0f;
+                budgetRangeText = "Recommended budget: 10,000 - 14,000 EGP";
                 break;
             case PartyOption::Option3:
                 partyMinBudget = 15000.0f;
-                partyMaxBudget = 24000.0f;
-                budgetRangeText = "Recommended budget: 15,000 - 24,000 EGP";
+                partyMaxBudget = 20000.0f;
+                budgetRangeText = "Recommended budget: 15,000 - 20,000 EGP";
                 break;
             case PartyOption::Option4:
                 partyMinBudget = 24000.0f;
-                partyMaxBudget = 38000.0f;
-                budgetRangeText = "Recommended budget: 24,000 - 38,000 EGP";
+                partyMaxBudget = 32000.0f;
+                budgetRangeText = "Recommended budget: 24,000 - 32,000 EGP";
                 break;
             case PartyOption::Option5:
                 partyMinBudget = 38000.0f;
-                partyMaxBudget = 54000.0f;
-                budgetRangeText = "Recommended budget: 38,000 - 54,000 EGP";
-                break;
-            case PartyOption::Option6:
-                partyMinBudget = 54000.0f;
-                partyMaxBudget = 66000.0f;
-                budgetRangeText = "Recommended budget: 54,000 - 66,000 EGP";
+                partyMaxBudget = 46000.0f;
+                budgetRangeText = "Recommended budget: 38,000 - 46,000 EGP";
                 break;
             default:
                 break;
@@ -834,100 +619,32 @@ void SetOptionBudgetRange()
         switch (selectedEngagementOption)
         {
             case EngagementOption::Option1:
-                engagementMinBudget = 72000.0f;
-                engagementMaxBudget = 270000.0f;
-                budgetRangeText = "Recommended budget: 72,000 - 270,000 EGP";
-                break;
-            case EngagementOption::Option2:
-                engagementMinBudget = 270000.0f;
-                engagementMaxBudget = 540000.0f;
-                budgetRangeText = "Recommended budget: 270,000 - 540,000 EGP";
-                break;
-            case EngagementOption::Option3:
-                engagementMinBudget = 540000.0f;
-                engagementMaxBudget = 900000.0f;
-                budgetRangeText = "Recommended budget: 540,000 - 900,000 EGP";
-                break;
-            case EngagementOption::Option4:
-                engagementMinBudget = 900000.0f;
-                engagementMaxBudget = 1800000.0f;
-                budgetRangeText = "Recommended budget: 900,000 - 1,800,000 EGP";
-                break;
-            case EngagementOption::Option5:
                 engagementMinBudget = 1800000.0f;
                 engagementMaxBudget = 2200000.0f;
                 budgetRangeText = "Recommended budget: 1,800,000 - 2,200,000 EGP";
                 break;
+            case EngagementOption::Option2:
+                engagementMinBudget = 900000.0f;
+                engagementMaxBudget = 1100000.0f;
+                budgetRangeText = "Recommended budget: 900,000 - 1,100,000 EGP";
+                break;
+            case EngagementOption::Option3:
+                engagementMinBudget = 540000.0f;
+                engagementMaxBudget = 660000.0f;
+                budgetRangeText = "Recommended budget: 540,000 - 660,000 EGP";
+                break;
+            case EngagementOption::Option4:
+                engagementMinBudget = 270000.0f;
+                engagementMaxBudget = 330000.0f;
+                budgetRangeText = "Recommended budget: 270,000 - 330,000 EGP";
+                break;
+            case EngagementOption::Option5:
+                engagementMinBudget = 72000.0f;
+                engagementMaxBudget = 88000.0f;
+                budgetRangeText = "Recommended budget: 72,000 - 88,000 EGP";
+                break;
             default:
                 break;
-        }
-    }
-}
-
-void UpdateSelectedOptionName()
-{
-    if (selectedEvent == EventType::Birthday)
-    {
-        switch (selectedBirthdayOption)
-        {
-            case BirthdayOption::Option1: selectedOptionName = "Basic"; break;
-            case BirthdayOption::Option2: selectedOptionName = "Mid"; break;
-            case BirthdayOption::Option3: selectedOptionName = "Premium"; break;
-            case BirthdayOption::Option4: selectedOptionName = "Deluxe"; break;
-            case BirthdayOption::Option5: selectedOptionName = "Luxury"; break;
-            case BirthdayOption::Option6: selectedOptionName = "Ultra Luxury"; break;
-            default: selectedOptionName.clear(); break;
-        }
-    }
-    else if (selectedEvent == EventType::Wedding)
-    {
-        switch (selectedWeddingOption)
-        {
-            case WeddingOption::Option1: selectedOptionName = "Ultra Luxury"; break;
-            case WeddingOption::Option2: selectedOptionName = "Luxury"; break;
-            case WeddingOption::Option3: selectedOptionName = "Premium"; break;
-            case WeddingOption::Option4: selectedOptionName = "Mid"; break;
-            case WeddingOption::Option5: selectedOptionName = "Budget"; break;
-            case WeddingOption::Option6: selectedOptionName = "Basic"; break;
-            default: selectedOptionName.clear(); break;
-        }
-    }
-    else if (selectedEvent == EventType::Party)
-    {
-        switch (selectedPartyOption)
-        {
-            case PartyOption::Option1: selectedOptionName = "Basic"; break;
-            case PartyOption::Option2: selectedOptionName = "Mid"; break;
-            case PartyOption::Option3: selectedOptionName = "Premium"; break;
-            case PartyOption::Option4: selectedOptionName = "Deluxe"; break;
-            case PartyOption::Option5: selectedOptionName = "Luxury"; break;
-            case PartyOption::Option6: selectedOptionName = "Ultra Luxury"; break;
-            default: selectedOptionName.clear(); break;
-        }
-    }
-    else if (selectedEvent == EventType::Conference)
-    {
-        switch (selectedConferenceOption)
-        {
-            case ConferenceOption::Option1: selectedOptionName = "Basic"; break;
-            case ConferenceOption::Option2: selectedOptionName = "Mid"; break;
-            case ConferenceOption::Option3: selectedOptionName = "Premium"; break;
-            case ConferenceOption::Option4: selectedOptionName = "Deluxe"; break;
-            case ConferenceOption::Option5: selectedOptionName = "Luxury"; break;
-            case ConferenceOption::Option6: selectedOptionName = "Elite"; break;
-            default: selectedOptionName.clear(); break;
-        }
-    }
-    else if (selectedEvent == EventType::Engagement)
-    {
-        switch (selectedEngagementOption)
-        {
-            case EngagementOption::Option1: selectedOptionName = "Budget"; break;
-            case EngagementOption::Option2: selectedOptionName = "Basic"; break;
-            case EngagementOption::Option3: selectedOptionName = "Mid"; break;
-            case EngagementOption::Option4: selectedOptionName = "Luxury"; break;
-            case EngagementOption::Option5: selectedOptionName = "Premium"; break;
-            default: selectedOptionName.clear(); break;
         }
     }
 }
@@ -964,10 +681,24 @@ std::vector<const char *> conferenceOption6Tasks = {
 // ------------------------------------------------------------
 // ------------------------------------------------------------
 
+enum Screen
+{
+    SCREEN_LOGIN,
+    SCREEN_CREATE_ACCOUNT,
+    SCREEN_APP,
+    SCREEN_MAIN_MENU,
+    SCREEN_EVENT_SELECTION,
+    SCREEN_EVENT_OPTIONS,
+    SCREEN_EVENT_TYPE,
+    SCREEN_EVENT_DETAILS,
+    SCREEN_DASHBOARD,
+    SCREEN_CALENDAR,
+    SCREEN_BUDGET_SYSTEM,
+    SCREEN_EVENT_LIST,
+    SCREEN_EVENT_BASIC_DETAILS
+};
 Screen currentScreen = SCREEN_LOGIN;
-Screen previousScreen = SCREEN_LOGIN;
 GLuint backgroundTexture = 0;
-GLuint pageBackgroundTexture = 0;
 
 // ===== BUDGET ALLOCATION PERCENTAGES =====
 // Birthday Party Budget Breakdown (by percentage for each option)
@@ -994,12 +725,6 @@ struct PartyBudgetAllocation {
 };
 PartyBudgetAllocation partyBudgetAlloc;
 
-// Conference Budget Breakdown
-struct ConferenceBudgetAllocation {
-    std::vector<std::pair<std::string, float>> categories[6];
-};
-ConferenceBudgetAllocation conferenceBudgetAlloc;
-
 void InitializeBudgetAllocations()
 {
     // Birthday - Option 1 (Basic, 8,000)
@@ -1022,24 +747,24 @@ void InitializeBudgetAllocations()
     };
     // Birthday - Option 4 (Aesthetic, 28,000)
     birthdayBudgetAlloc.categories[3] = {
-        {"Venue", 28.6f}, {"Decorations", 16.1f}, {"Catering", 19.6f},
-        {"Cake", 7.1f}, {"Entertainment", 4.5f}, {"Sound System", 3.6f},
-        {"Lighting", 5.4f}, {"Decor Upgrade", 4.5f}, {"Photographer", 4.5f},
-        {"Videography", 2.7f}, {"Party Favors", 1.8f}, {"Activities/Games", 1.6f}
+        {"Venue", 32.0f}, {"Decorations", 18.0f}, {"Catering", 22.0f},
+        {"Cake", 8.0f}, {"Entertainment", 5.0f}, {"Sound System", 4.0f},
+        {"Lighting", 6.0f}, {"Decor Upgrade", 5.0f}, {"Photographer", 5.0f},
+        {"Videography", 3.0f}, {"Party Favors", 2.0f}, {"Activities/Games", 2.0f}
     };
     // Birthday - Option 5 (Entertainment-Heavy, 42,000)
     birthdayBudgetAlloc.categories[4] = {
-        {"Venue", 20.8f}, {"Decorations", 12.5f}, {"Catering", 16.7f},
-        {"Cake", 5.0f}, {"Entertainment", 16.7f}, {"Sound System", 5.8f},
-        {"Lighting", 5.0f}, {"Decor Upgrade", 3.3f}, {"Photographer", 3.3f},
-        {"Videography", 1.7f}, {"Party Favors", 1.7f}, {"Activities/Games", 6.7f}, {"Miscellaneous", 0.8f}
+        {"Venue", 25.0f}, {"Decorations", 15.0f}, {"Catering", 20.0f},
+        {"Cake", 6.0f}, {"Entertainment", 20.0f}, {"Sound System", 7.0f},
+        {"Lighting", 6.0f}, {"Decor Upgrade", 4.0f}, {"Photographer", 4.0f},
+        {"Videography", 2.0f}, {"Party Favors", 2.0f}, {"Activities/Games", 8.0f}, {"Miscellaneous", 1.0f}
     };
     // Birthday - Option 6 (Luxury, 60,000)
     birthdayBudgetAlloc.categories[5] = {
-        {"Venue", 26.9f}, {"Decorations", 10.8f}, {"Catering", 21.5f},
-        {"Cake", 7.7f}, {"Entertainment", 7.7f}, {"Sound System", 4.6f},
-        {"Lighting", 5.4f}, {"Decor Upgrade", 3.8f}, {"Photographer", 4.6f},
-        {"Videography", 3.1f}, {"Party Favors", 2.3f}, {"Activities/Games", 1.6f}
+        {"Venue", 35.0f}, {"Decorations", 14.0f}, {"Catering", 28.0f},
+        {"Cake", 10.0f}, {"Entertainment", 10.0f}, {"Sound System", 6.0f},
+        {"Lighting", 7.0f}, {"Decor Upgrade", 5.0f}, {"Photographer", 6.0f},
+        {"Videography", 4.0f}, {"Party Favors", 3.0f}, {"Activities/Games", 2.0f}
     };
 
     // Wedding - Option 1 (Ultra Luxury)
@@ -1048,21 +773,21 @@ void InitializeBudgetAllocations()
         {"Makeup/Coiffeur", 1.0f}, {"Venue", 25.0f}, {"Dance Floor", 5.0f},
         {"Lights", 3.0f}, {"Decoration", 3.0f}, {"Photographer", 2.0f},
         {"Catering", 11.5f}, {"Painter", 2.0f}, {"DJ", 5.0f},
-        {"Singer", 15.0f}, {"Cinematography", 2.0f}, {"Wedding Favors", 7.0f}, {"Transportation", 1.0f}
+        {"Singer", 15.0f}, {"Cinematography", 2.0f}, {"Wedding Favors", 7.0f}, {"Transportation", 1.5f}
     };
     // Wedding - Option 2 (High Luxury)
     weddingBudgetAlloc.categories[1] = {
-        {"Suit", 6.2f}, {"Wedding Dress", 12.4f}, {"Bouquet", 1.0f},
-        {"Makeup/Coiffeur", 3.1f}, {"Venue", 32.0f}, {"Dance Floor", 4.1f},
-        {"Lights", 5.2f}, {"Decoration", 6.2f}, {"Photographer", 6.2f},
-        {"Catering", 16.5f}, {"DJ", 5.2f}, {"Cinematography", 1.9f}
+        {"Suit", 6.0f}, {"Wedding Dress", 12.0f}, {"Bouquet", 1.0f},
+        {"Makeup/Coiffeur", 3.0f}, {"Venue", 31.0f}, {"Dance Floor", 4.0f},
+        {"Lights", 5.0f}, {"Decoration", 6.0f}, {"Photographer", 6.0f},
+        {"Catering", 16.0f}, {"DJ", 5.0f}, {"Cinematography", 2.0f}
     };
     // Wedding - Option 3 (Upper Mid Luxury)
     weddingBudgetAlloc.categories[2] = {
-        {"Suit", 5.9f}, {"Wedding Dress", 11.8f}, {"Bouquet", 0.98f},
-        {"Makeup/Coiffeur", 2.9f}, {"Venue", 26.5f}, {"Dance Floor", 4.9f},
-        {"Lights", 4.9f}, {"Decoration", 5.9f}, {"Photographer", 7.8f},
-        {"Catering", 17.6f}, {"DJ", 5.9f}, {"Cinematography", 5.0f}
+        {"Suit", 6.0f}, {"Wedding Dress", 12.0f}, {"Bouquet", 1.0f},
+        {"Makeup/Coiffeur", 3.0f}, {"Venue", 27.0f}, {"Dance Floor", 5.0f},
+        {"Lights", 5.0f}, {"Decoration", 6.0f}, {"Photographer", 8.0f},
+        {"Catering", 18.0f}, {"DJ", 6.0f}, {"Cinematography", 5.0f}
     };
     // Wedding - Option 4 (Mid Range)
     weddingBudgetAlloc.categories[3] = {
@@ -1080,17 +805,17 @@ void InitializeBudgetAllocations()
     };
     // Wedding - Option 6 (Low Budget)
     weddingBudgetAlloc.categories[5] = {
-        {"Suit", 6.9f}, {"Wedding Dress", 12.7f}, {"Bouquet", 0.98f},
-        {"Dance Floor", 17.6f}, {"Lights", 5.9f}, {"Decoration", 6.9f},
-        {"Photographer", 6.9f}, {"Catering", 27.5f}, {"Soundsystem", 14.62f}
+        {"Suit", 7.0f}, {"Wedding Dress", 13.0f}, {"Bouquet", 1.0f},
+        {"Dance Floor", 18.0f}, {"Lights", 6.0f}, {"Decoration", 7.0f},
+        {"Photographer", 7.0f}, {"Catering", 28.0f}, {"Soundsystem", 15.0f}
     };
 
     // Engagement - Option 1 (Premium)
     engagementBudgetAlloc.categories[0] = {
-        {"Outfit", 11.4f}, {"Makeup/Hair", 4.8f}, {"Venue", 19.0f},
-        {"Decor", 17.1f}, {"Lighting", 4.8f}, {"Photographer", 4.8f},
-        {"Videography", 4.8f}, {"Catering", 9.5f}, {"DJ/Sound", 6.7f},
-        {"Singer/Entertainment", 6.7f}, {"Cake", 2.9f}, {"Favors", 4.8f}, {"Transportation", 2.7f}
+        {"Outfit", 12.0f}, {"Makeup/Hair", 5.0f}, {"Venue", 20.0f},
+        {"Decor", 18.0f}, {"Lighting", 5.0f}, {"Photographer", 5.0f},
+        {"Videography", 5.0f}, {"Catering", 10.0f}, {"DJ/Sound", 7.0f},
+        {"Singer/Entertainment", 7.0f}, {"Cake", 3.0f}, {"Favors", 5.0f}, {"Transportation", 3.0f}
     };
     // Engagement - Option 2 (High Tier)
     engagementBudgetAlloc.categories[1] = {
@@ -1132,76 +857,27 @@ void InitializeBudgetAllocations()
     };
     // Party - Option 3 (Balanced)
     partyBudgetAlloc.categories[2] = {
-        {"Venue", 31.8f}, {"Decor", 15.9f}, {"Lighting", 4.5f},
-        {"Photographer", 5.7f}, {"Videography", 3.4f}, {"Catering/Food & Drinks", 29.5f},
-        {"DJ/Soundsystem", 9.2f}, {"Entertainment", 0.0f}, {"Favors/Giveaways", 0.0f}
+        {"Venue", 28.0f}, {"Decor", 14.0f}, {"Lighting", 4.0f},
+        {"Photographer", 5.0f}, {"Videography", 3.0f}, {"Catering/Food & Drinks", 26.0f},
+        {"DJ/Soundsystem", 8.0f}, {"Entertainment", 0.0f}, {"Favors/Giveaways", 0.0f}
     };
     // Party - Option 4 (Aesthetic)
     partyBudgetAlloc.categories[3] = {
-        {"Venue", 34.0f}, {"Decor", 19.1f}, {"Lighting", 6.4f},
-        {"Photographer", 5.3f}, {"Videography", 0.0f}, {"Catering/Food & Drinks", 23.4f},
-        {"DJ/Soundsystem", 4.3f}, {"Entertainment", 5.3f}, {"Favors/Giveaways", 2.2f}, {"Transportation", 0.0f}
+        {"Venue", 32.0f}, {"Decor", 18.0f}, {"Lighting", 6.0f},
+        {"Photographer", 5.0f}, {"Videography", 0.0f}, {"Catering/Food & Drinks", 22.0f},
+        {"DJ/Soundsystem", 4.0f}, {"Entertainment", 5.0f}, {"Favors/Giveaways", 2.0f}, {"Transportation", 0.0f}
     };
     // Party - Option 5 (Entertainment-Heavy)
     partyBudgetAlloc.categories[4] = {
-        {"Venue", 24.8f}, {"Decor", 14.9f}, {"Lighting", 5.9f},
-        {"Photographer", 4.0f}, {"Videography", 2.0f}, {"Catering/Food & Drinks", 19.8f},
-        {"DJ/Soundsystem", 6.9f}, {"Entertainment", 19.8f}, {"Favors/Giveaways", 1.9f}
+        {"Venue", 25.0f}, {"Decor", 15.0f}, {"Lighting", 6.0f},
+        {"Photographer", 4.0f}, {"Videography", 2.0f}, {"Catering/Food & Drinks", 20.0f},
+        {"DJ/Soundsystem", 7.0f}, {"Entertainment", 20.0f}, {"Favors/Giveaways", 2.0f}
     };
     // Party - Option 6 (Luxury)
     partyBudgetAlloc.categories[5] = {
-        {"Venue", 34.0f}, {"Decor", 13.6f}, {"Lighting", 6.8f},
-        {"Photographer", 5.8f}, {"Videography", 3.9f}, {"Catering/Food & Drinks", 27.2f},
-        {"DJ/Soundsystem", 5.8f}, {"Entertainment", 0.0f}, {"Favors/Giveaways", 2.9f}
-    };
-
-    // Conference - Option 1 (Minimal)
-    conferenceBudgetAlloc.categories[0] = {
-        {"Venue", 35.0f}, {"Registration & Materials", 25.0f},
-        {"Catering (Coffee/Food)", 20.0f}, {"Tech (Screens/Projectors)", 20.0f}
-    };
-    // Conference - Option 2 (Basic)
-    conferenceBudgetAlloc.categories[1] = {
-        {"Venue", 30.0f}, {"Stage Setup", 10.0f}, {"Audio System", 10.0f},
-        {"Registration & Materials", 15.0f}, {"Catering (Coffee/Food)", 20.0f},
-        {"Marketing & Promotion", 5.0f}, {"Speakers / Guest Fees", 5.0f},
-        {"Tech (Screens/Projectors)", 5.0f}
-    };
-    // Conference - Option 3 (Standard)
-    conferenceBudgetAlloc.categories[2] = {
-        {"Venue", 24.3f}, {"Stage Setup", 10.4f}, {"Audio System", 8.7f},
-        {"Lighting", 4.3f}, {"Registration & Materials", 10.4f},
-        {"Catering (Coffee/Food)", 15.7f}, {"Marketing & Promotion", 5.2f},
-        {"Photography", 3.5f}, {"Speakers / Guest Fees", 8.7f},
-        {"Branding (Banners, Booths)", 2.6f}, {"Tech (Screens/Projectors)", 4.3f},
-        {"Security", 1.9f}
-    };
-    // Conference - Option 4 (Professional)
-    conferenceBudgetAlloc.categories[3] = {
-        {"Venue", 20.2f}, {"Stage Setup", 12.1f}, {"Audio System", 8.1f},
-        {"Lighting", 5.6f}, {"Registration & Materials", 8.1f},
-        {"Catering (Coffee/Food)", 14.5f}, {"Marketing & Promotion", 5.6f},
-        {"Photography", 4.0f}, {"Videography", 2.4f},
-        {"Speakers / Guest Fees", 9.7f}, {"Branding (Banners, Booths)", 3.2f},
-        {"Security", 2.4f}, {"Tech (Screens/Projectors)", 4.0f}, {"Miscellaneous", 0.1f}
-    };
-    // Conference - Option 5 (Premium)
-    conferenceBudgetAlloc.categories[4] = {
-        {"Venue", 17.7f}, {"Stage Setup", 12.1f}, {"Audio System", 9.7f},
-        {"Lighting", 6.5f}, {"Registration & Materials", 6.5f},
-        {"Catering (Coffee/Food)", 16.1f}, {"Marketing & Promotion", 5.6f},
-        {"Photography", 4.0f}, {"Videography", 3.2f},
-        {"Speakers / Guest Fees", 8.1f}, {"Branding (Banners, Booths)", 3.2f},
-        {"Security", 3.2f}, {"Tech (Screens/Projectors)", 4.0f}, {"Miscellaneous", 0.1f}
-    };
-    // Conference - Option 6 (Elite Summit)
-    conferenceBudgetAlloc.categories[5] = {
-        {"Venue", 15.7f}, {"Stage Setup", 14.2f}, {"Audio System", 9.4f},
-        {"Lighting", 7.9f}, {"Registration & Materials", 4.7f},
-        {"Catering (Coffee/Food)", 17.3f}, {"Marketing & Promotion", 4.7f},
-        {"Photography", 4.7f}, {"Videography", 3.9f},
-        {"Speakers / Guest Fees", 6.3f}, {"Branding (Banners, Booths)", 3.1f},
-        {"Security", 3.9f}, {"Tech (Screens/Projectors)", 3.9f}, {"Miscellaneous", 0.3f}
+        {"Venue", 35.0f}, {"Decor", 14.0f}, {"Lighting", 7.0f},
+        {"Photographer", 6.0f}, {"Videography", 4.0f}, {"Catering/Food & Drinks", 28.0f},
+        {"DJ/Soundsystem", 6.0f}, {"Entertainment", 0.0f}, {"Favors/Giveaways", 3.0f}
     };
 }
 
@@ -1220,7 +896,7 @@ void RenderEventTypePage()
     if (ImGui::Button("Wedding", ImVec2(200.0f, 60.0f))) {
         selectedEvent = EventType::Wedding;
         ResetEventOptionState();
-        selectedEventName[0] = '\0';
+        strcpy(selectedEventName, "Wedding");
         selectedEventDate[0] = '\0';
         selectedEventLocation[0] = '\0';
         selectedEventGuests[0] = '\0';
@@ -1235,7 +911,7 @@ void RenderEventTypePage()
     if (ImGui::Button("Engagement", ImVec2(200.0f, 60.0f))) {
         selectedEvent = EventType::Engagement;
         ResetEventOptionState();
-        selectedEventName[0] = '\0';
+        strcpy(selectedEventName, "Engagement");
         selectedEventDate[0] = '\0';
         selectedEventLocation[0] = '\0';
         selectedEventGuests[0] = '\0';
@@ -1250,7 +926,7 @@ void RenderEventTypePage()
     if (ImGui::Button("Birthday Party", ImVec2(200.0f, 60.0f))) {
         selectedEvent = EventType::Birthday;
         ResetEventOptionState();
-        selectedEventName[0] = '\0';
+        strcpy(selectedEventName, "Birthday Party");
         selectedEventDate[0] = '\0';
         selectedEventLocation[0] = '\0';
         selectedEventGuests[0] = '\0';
@@ -1265,7 +941,7 @@ void RenderEventTypePage()
     if (ImGui::Button("Party", ImVec2(200.0f, 60.0f))) {
         selectedEvent = EventType::Party;
         ResetEventOptionState();
-        selectedEventName[0] = '\0';
+        strcpy(selectedEventName, "Party");
         selectedEventDate[0] = '\0';
         selectedEventLocation[0] = '\0';
         selectedEventGuests[0] = '\0';
@@ -1279,7 +955,7 @@ void RenderEventTypePage()
     if (ImGui::Button("Conference", ImVec2(200.0f, 60.0f))) {
         selectedEvent = EventType::Conference;
         ResetEventOptionState();
-        selectedEventName[0] = '\0';
+        strcpy(selectedEventName, "Conference");
         selectedEventDate[0] = '\0';
         selectedEventLocation[0] = '\0';
         selectedEventGuests[0] = '\0';
@@ -1296,6 +972,7 @@ void RenderEventTypePage()
 
     if (ImGui::Button("Back to Home", ImVec2(160.0f, 35.0f)))
     {
+        syncAndSaveCurrentEvent();
         currentScreen = SCREEN_MAIN_MENU;
     }
 
@@ -1540,7 +1217,6 @@ void saveAccount(const char *username, const char *password)
                 taskDaysLeft.push_back(std::stoi(item));
             }
         }
-    }
 }
 */
 
@@ -1613,173 +1289,6 @@ std::string escapeJsonString(const std::string& str) {
     return result;
 }
 
-std::string ShellEscape(const std::string& arg) {
-    std::string escaped = "'";
-    for (char c : arg) {
-        if (c == '\'')
-            escaped += "'\''";
-        else
-            escaped += c;
-    }
-    escaped += "'";
-    return escaped;
-}
-
-std::string FindOllamaExecutable() {
-    if (std::strlen(chatbotOllamaPath) > 0) {
-        std::filesystem::path p(chatbotOllamaPath);
-        if (std::filesystem::exists(p) && !std::filesystem::is_directory(p)) {
-            return p.string();
-        }
-    }
-
-    const char *pathEnv = std::getenv("OLLAMA_PATH");
-    if (pathEnv && std::strlen(pathEnv) > 0) {
-        std::filesystem::path p(pathEnv);
-        if (std::filesystem::exists(p) && !std::filesystem::is_directory(p)) {
-            return p.string();
-        }
-    }
-
-    const std::vector<std::string> candidates = {
-        "/opt/homebrew/bin/ollama",
-        "/usr/local/bin/ollama"
-    };
-
-    for (const auto &candidate : candidates) {
-        std::filesystem::path p(candidate);
-        if (std::filesystem::exists(p) && !std::filesystem::is_directory(p)) {
-            return p.string();
-        }
-    }
-
-    FILE *pipe = popen("which ollama 2>/dev/null", "r");
-    if (pipe) {
-        char buf[256];
-        if (fgets(buf, sizeof(buf), pipe)) {
-            std::string path(buf);
-            path.erase(std::remove(path.begin(), path.end(), '\n'), path.end());
-            if (!path.empty() && std::filesystem::exists(path)) {
-                pclose(pipe);
-                return path;
-            }
-        }
-        pclose(pipe);
-    }
-
-    return "";
-}
-
-std::string RunShellCommand(const std::string &command) {
-    FILE *pipe = popen(command.c_str(), "r");
-    if (!pipe) {
-        return "Failed to execute command.";
-    }
-
-    char buffer[256];
-    std::string result;
-    while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-        result += buffer;
-    }
-    int returnCode = pclose(pipe);
-    if (result.empty() && returnCode != 0) {
-        result = "Command failed with code ";
-        result += std::to_string(returnCode);
-    }
-    return result;
-}
-
-std::string RunOllamaQuery(const std::string &prompt) {
-    const char *modelEnv = std::getenv("OLLAMA_MODEL");
-    std::string model = modelEnv ? modelEnv : std::string(chatbotOllamaModel);
-    std::string ollamaPath = FindOllamaExecutable();
-    if (ollamaPath.empty()) {
-        return "Could not find the ollama executable. Install ollama or set OLLAMA_PATH or the Ollama Path field in the UI to the full path of the ollama binary. Checked /opt/homebrew/bin/ollama, /usr/local/bin/ollama, and PATH.";
-    }
-
-    std::string command = ollamaPath + " run " + model + " " + ShellEscape(prompt) + " 2>&1";
-    std::string result = RunShellCommand(command);
-    if (result.find("unknown command \"run\"") != std::string::npos || result.find("unknown command: 'run'") != std::string::npos || result.find("unknown command run") != std::string::npos) {
-        std::string fallback = ollamaPath + " query " + model + " " + ShellEscape(prompt) + " 2>&1";
-        return RunShellCommand(fallback);
-    }
-    return result;
-}
-
-std::string RunGroqRequest(const std::string &prompt) {
-    const char *apiKeyEnv = std::getenv("GROQ_API_KEY");
-    std::string apiKey = apiKeyEnv && std::strlen(apiKeyEnv) > 0 ? apiKeyEnv : std::string(chatbotGroqApiKey);
-    if (apiKey.empty()) {
-        return "GROQ API key is not set. Set GROQ_API_KEY or enter it in the chatbot settings UI before using GROQ.";
-    }
-    const char *modelEnv = std::getenv("GROQ_MODEL");
-    std::string model = modelEnv ? modelEnv : std::string(chatbotGroqModel);
-    std::string payload = "{\"model\":\"" + escapeJsonString(model) + "\",\"prompt\":\"" + escapeJsonString(prompt) + "\",\"max_output_tokens\":256}";
-    std::string command = "curl -s -X POST https://api.groq.com/v1/complete -H 'Authorization: Bearer " + apiKey + "' -H 'Content-Type: application/json' -d " + ShellEscape(payload);
-    std::string response = RunShellCommand(command);
-
-    auto start = response.find("\"completion\"");
-    if (start == std::string::npos) {
-        return response;
-    }
-    auto colon = response.find(':', start);
-    if (colon == std::string::npos) {
-        return response;
-    }
-    auto quote = response.find('"', colon);
-    if (quote == std::string::npos) {
-        return response;
-    }
-    auto end = response.find('"', quote + 1);
-    if (end == std::string::npos) {
-        return response;
-    }
-    std::string completion = response.substr(quote + 1, end - quote - 1);
-    return completion;
-}
-
-std::string RunChatbotPrompt(const std::string &prompt) {
-    if (prompt.empty()) {
-        return "Please enter a prompt for the planner.";
-    }
-    const char *providerEnv = std::getenv("CHATBOT_PROVIDER");
-    std::string provider = providerEnv ? providerEnv : std::string(chatbotProvider);
-    std::transform(provider.begin(), provider.end(), provider.begin(), ::tolower);
-    if (provider == "groq") {
-        return RunGroqRequest(prompt);
-    }
-    if (provider == "ollama") {
-        return RunOllamaQuery(prompt);
-    }
-    return "CHATBOT_PROVIDER must be set to 'ollama' or 'groq'. Current value: " + provider;
-}
-
-std::vector<std::string> ParseChatbotTaskSuggestions(const std::string &response) {
-    std::vector<std::string> tasks;
-    std::istringstream stream(response);
-    std::string line;
-    while (std::getline(stream, line)) {
-        // Trim whitespace and common list prefixes
-        size_t start = line.find_first_not_of(" \t-•0123456789.");
-        if (start == std::string::npos) continue;
-        size_t end = line.find_last_not_of(" \t\r\n");
-        if (end == std::string::npos || end < start) continue;
-        std::string clean = line.substr(start, end - start + 1);
-        if (clean.empty()) continue;
-        tasks.push_back(clean);
-    }
-    return tasks;
-}
-
-std::string BuildChatbotConversationPrompt(const std::string &userMessage) {
-    std::string prompt = "You are a helpful event planning assistant. Answer questions clearly and politely.\n";
-    for (const auto &entry : chatbotConversation) {
-        prompt += "User: " + entry.first + "\nAssistant: " + entry.second + "\n";
-    }
-    prompt += "User: " + userMessage + "\nAssistant:";
-    return prompt;
-}
-
 // Helper function to sanitize filename
 std::string sanitizeFilename(const std::string& name) {
     std::string result;
@@ -1797,28 +1306,10 @@ std::string sanitizeFilename(const std::string& name) {
     return result;
 }
 
-std::string getCurrentUserEventsDirectory() {
-    std::string safeUser = sanitizeFilename(currentUsername.empty() ? "anonymous" : currentUsername);
-    return "events/" + safeUser;
-}
-
-std::string getEventFilename(const Event& event) {
-    std::string safeName = sanitizeFilename(event.name);
-    return getCurrentUserEventsDirectory() + "/" + safeName + ".json";
-}
-
-void deleteEventFile(const Event& event) {
-    std::string filename = getEventFilename(event);
-    if (std::filesystem::exists(filename)) {
-        std::filesystem::remove(filename);
-    }
-}
-
 void saveEvent(const Event& event) {
     std::string safeName = sanitizeFilename(event.name);
-    std::filesystem::path userDir = getCurrentUserEventsDirectory();
-    std::filesystem::create_directories(userDir);
-    std::string filename = (userDir / (safeName + ".json")).string();
+    std::string filename = "events/" + safeName + ".json";
+    std::filesystem::create_directories("events");
     std::ofstream file(filename);
     if (!file.is_open()) return;
 
@@ -1831,9 +1322,6 @@ void saveEvent(const Event& event) {
     file << "  \"notes\": \"" << escapeJsonString(event.notes) << "\",\n";
     file << "  \"type\": " << static_cast<int>(event.type) << ",\n";
     file << "  \"selectedOption\": " << event.selectedOption << ",\n";
-    file << "  \"budgetInputOption\": " << event.budgetInputOption << ",\n";
-    file << "  \"budgetInputLocked\": " << (event.budgetInputLocked ? "true" : "false") << ",\n";
-    file << "  \"spentBudget\": " << event.spentBudget << ",\n";
     file << "  \"tasks\": [\n";
     for (size_t i = 0; i < event.tasks.size(); ++i) {
         file << "    \"" << escapeJsonString(event.tasks[i]) << "\"";
@@ -1845,13 +1333,6 @@ void saveEvent(const Event& event) {
     for (size_t i = 0; i < event.taskCompleted.size(); ++i) {
         file << "    " << (event.taskCompleted[i] ? "true" : "false");
         if (i < event.taskCompleted.size() - 1) file << ",";
-        file << "\n";
-    }
-    file << "  ],\n";
-    file << "  \"calendarTasks\": [\n";
-    for (size_t i = 0; i < event.calendarTasks.size(); ++i) {
-        file << "    \"" << escapeJsonString(SerializeCalendarTask(event.calendarTasks[i])) << "\"";
-        if (i < event.calendarTasks.size() - 1) file << ",";
         file << "\n";
     }
     file << "  ]\n";
@@ -1880,158 +1361,11 @@ std::string unescapeJsonString(const std::string& str) {
     return result;
 }
 
-std::vector<std::string> parseJsonStringArray(const std::string& content, const std::string& key) {
-    std::vector<std::string> values;
-    std::string search = "\"" + key + "\":";
-    size_t pos = content.find(search);
-    if (pos == std::string::npos) return values;
-
-    pos += search.length();
-    while (pos < content.length() && std::isspace(static_cast<unsigned char>(content[pos]))) pos++;
-    if (pos >= content.length() || content[pos] != '[') return values;
-    pos++;
-
-    while (pos < content.length()) {
-        while (pos < content.length() && std::isspace(static_cast<unsigned char>(content[pos]))) pos++;
-        if (pos >= content.length() || content[pos] == ']') break;
-        if (content[pos] != '"') {
-            pos++;
-            continue;
-        }
-        pos++;
-
-        std::string item;
-        bool escaped = false;
-        while (pos < content.length()) {
-            char c = content[pos++];
-            if (escaped) {
-                item += c;
-                escaped = false;
-            } else if (c == '\\') {
-                escaped = true;
-            } else if (c == '"') {
-                break;
-            } else {
-                item += c;
-            }
-        }
-
-        values.push_back(unescapeJsonString(item));
-
-        while (pos < content.length() && std::isspace(static_cast<unsigned char>(content[pos]))) pos++;
-        if (pos < content.length() && content[pos] == ',') pos++;
-    }
-
-    return values;
-}
-
-std::string escapeTaskField(const std::string& value) {
-    std::string escaped;
-    for (char c : value) {
-        if (c == '\\') {
-            escaped += "\\\\";
-        } else if (c == '|') {
-            escaped += "\\|";
-        } else {
-            escaped += c;
-        }
-    }
-    return escaped;
-}
-
-std::string unescapeTaskField(const std::string& value) {
-    std::string unescaped;
-    for (size_t i = 0; i < value.size(); ++i) {
-        if (value[i] == '\\' && i + 1 < value.size()) {
-            if (value[i + 1] == '|' || value[i + 1] == '\\') {
-                unescaped += value[i + 1];
-                i++;
-            } else {
-                unescaped += value[i];
-            }
-        } else {
-            unescaped += value[i];
-        }
-    }
-    return unescaped;
-}
-
-std::string SerializeCalendarTask(const CalendarTask& task) {
-    std::ostringstream ss;
-    ss << task.id << "|"
-       << escapeTaskField(task.title) << "|"
-       << escapeTaskField(task.notes) << "|"
-       << task.dayOfWeek << "|"
-       << task.startHour << "|"
-       << task.startMinute << "|"
-       << task.endHour << "|"
-       << task.endMinute << "|"
-       << escapeTaskField(task.colorTag) << "|"
-       << (task.completed ? 1 : 0) << "|"
-       << task.members.size();
-    for (const auto& member : task.members) {
-        ss << "|" << escapeTaskField(member.name);
-    }
-    return ss.str();
-}
-
-CalendarTask DeserializeCalendarTask(const std::string& data) {
-    CalendarTask task;
-    task.color = ImVec4(0.5f, 0.5f, 0.5f, 0.8f);
-    task.completed = false;
-    task.members.clear();
-
-    std::vector<std::string> parts;
-    std::string current;
-    bool escape = false;
-    for (char c : data) {
-        if (escape) {
-            current += c;
-            escape = false;
-        } else if (c == '\\') {
-            escape = true;
-        } else if (c == '|') {
-            parts.push_back(current);
-            current.clear();
-        } else {
-            current += c;
-        }
-    }
-    parts.push_back(current);
-
-    if (parts.size() >= 11) {
-        task.id = std::stoi(parts[0]);
-        task.title = unescapeTaskField(parts[1]);
-        task.notes = unescapeTaskField(parts[2]);
-        task.dayOfWeek = std::stoi(parts[3]);
-        task.startHour = std::stoi(parts[4]);
-        task.startMinute = std::stoi(parts[5]);
-        task.endHour = std::stoi(parts[6]);
-        task.endMinute = std::stoi(parts[7]);
-        task.colorTag = unescapeTaskField(parts[8]);
-        task.color = GetColorForTag(task.colorTag);
-        task.completed = (std::stoi(parts[9]) != 0);
-        int memberCount = std::stoi(parts[10]);
-        for (int i = 0; i < memberCount && 11 + i < (int)parts.size(); ++i) {
-            CalendarMember member;
-            member.name = unescapeTaskField(parts[11 + i]);
-            task.members.push_back(member);
-        }
-    }
-    return task;
-}
-
 void loadEvents() {
     savedEvents.clear();
-    if (currentUsername.empty()) {
-        return;
-    }
-    std::filesystem::path userDir = getCurrentUserEventsDirectory();
-    if (!std::filesystem::exists(userDir)) {
-        return;
-    }
+    std::filesystem::create_directories("events");
     
-    for (const auto& entry : std::filesystem::directory_iterator(userDir)) {
+    for (const auto& entry : std::filesystem::directory_iterator("events")) {
         if (entry.path().extension() == ".json") {
             std::ifstream file(entry.path());
             if (!file.is_open()) continue;
@@ -2096,30 +1430,28 @@ void loadEvents() {
             } else {
                 event.selectedOption = 0;
             }
-
-            std::string budgetModeStr = findJsonValue("budgetInputOption");
-            if (!budgetModeStr.empty()) {
-                try { event.budgetInputOption = std::stoi(budgetModeStr); } catch (...) { event.budgetInputOption = 0; }
-            } else {
-                event.budgetInputOption = 0;
-            }
-
-            std::string lockedStr = findJsonValue("budgetInputLocked");
-            if (!lockedStr.empty()) {
-                event.budgetInputLocked = (lockedStr == "true");
-            } else {
-                event.budgetInputLocked = false;
-            }
-
-            std::string spentStr = findJsonValue("spentBudget");
-            if (!spentStr.empty()) {
-                try { event.spentBudget = std::stof(spentStr); } catch (...) { event.spentBudget = 0.0f; }
-            } else {
-                event.spentBudget = 0.0f;
-            }
             
             // Parse tasks array
-            event.tasks = parseJsonStringArray(content, "tasks");
+            std::string tasksKey = "\"tasks\":";
+            size_t tasksPos = content.find(tasksKey);
+            if (tasksPos != std::string::npos) {
+                tasksPos += tasksKey.length();
+                size_t arrayStart = content.find('[', tasksPos);
+                size_t arrayEnd = content.find(']', arrayStart);
+                if (arrayStart != std::string::npos && arrayEnd != std::string::npos) {
+                    std::string arrayContent = content.substr(arrayStart + 1, arrayEnd - arrayStart - 1);
+                    std::stringstream ss(arrayContent);
+                    std::string item;
+                    while (std::getline(ss, item, ',')) {
+                        // Trim whitespace and quotes
+                        item.erase(item.begin(), std::find_if(item.begin(), item.end(), [](int ch) { return !std::isspace(ch) && ch != '"'; }));
+                        item.erase(std::find_if(item.rbegin(), item.rend(), [](int ch) { return !std::isspace(ch) && ch != '"'; }).base(), item.end());
+                        if (!item.empty()) {
+                            event.tasks.push_back(unescapeJsonString(item));
+                        }
+                    }
+                }
+            }
             
             // Parse taskCompleted array
             std::string completedKey = "\"taskCompleted\":";
@@ -2140,14 +1472,6 @@ void loadEvents() {
                     }
                 }
             }
-
-            // Parse calendarTasks array
-            {
-                auto serializedCalendarTasks = parseJsonStringArray(content, "calendarTasks");
-                for (const auto& serializedTask : serializedCalendarTasks) {
-                    event.calendarTasks.push_back(DeserializeCalendarTask(serializedTask));
-                }
-            }
             
             // Ensure taskCompleted has same size as tasks
             while (event.taskCompleted.size() < event.tasks.size()) {
@@ -2164,24 +1488,6 @@ void loadEvents() {
 // ------------------------------------------------------------
 
 void CreateEventWithOption(int optionIndex, float budget, const std::string& defaultName) {
-    if (currentEvent && currentEvent->type == selectedEvent && currentEvent->selectedOption == optionIndex && currentEvent->name == defaultName)
-    {
-        ClearSelectedEventDetailFields();
-        currentScreen = SCREEN_EVENT_DETAILS;
-        return;
-    }
-
-    for (auto &event : savedEvents)
-    {
-        if (event.type == selectedEvent && event.selectedOption == optionIndex && event.name == defaultName)
-        {
-            currentEvent = &event;
-            ClearSelectedEventDetailFields();
-            currentScreen = SCREEN_EVENT_DETAILS;
-            return;
-        }
-    }
-
     Event newEvent;
     newEvent.name = defaultName;
     newEvent.date = "2026-05-11"; // default date
@@ -2262,19 +1568,16 @@ void CreateEventWithOption(int optionIndex, float budget, const std::string& def
     }
     
     newEvent.taskCompleted.assign(newEvent.tasks.size(), false);
-    newEvent.budgetInputOption = 0;
-    newEvent.budgetInputLocked = false;
-    newEvent.spentBudget = 0.0f;
     
     savedEvents.push_back(newEvent);
     currentEvent = &savedEvents.back();
     saveEvent(newEvent);
     
-    // Leave the detail fields blank until the user types them
-    selectedEventName[0] = '\0';
-    selectedEventDate[0] = '\0';
-    selectedEventLocation[0] = '\0';
-    selectedEventGuests[0] = '\0';
+    // Set dashboard variables
+    strcpy(selectedEventName, newEvent.name.c_str());
+    strcpy(selectedEventDate, newEvent.date.c_str());
+    strcpy(selectedEventLocation, newEvent.location.c_str());
+    strcpy(selectedEventGuests, newEvent.guestList.c_str());
     totalBudget = newEvent.budget;
     spentBudget = 0.0f;
     
@@ -2311,52 +1614,20 @@ void CreateEventWithOption(int optionIndex, float budget, const std::string& def
 void syncAndSaveCurrentEvent() {
     if (!currentEvent) return;
     
-    std::string oldFilename = getEventFilename(*currentEvent);
-    bool nameChanged = currentEvent->name != selectedEventName;
-
     // Sync from dashboard variables
-    if (strlen(selectedEventName) > 0) {
-        currentEvent->name = selectedEventName;
-    }
-    if (strlen(selectedEventDate) > 0) {
-        currentEvent->date = selectedEventDate;
-    }
-    if (strlen(selectedEventLocation) > 0) {
-        currentEvent->location = selectedEventLocation;
-    }
-    if (strlen(selectedEventGuests) > 0) {
-        currentEvent->guestList = selectedEventGuests;
-    }
+    currentEvent->name = selectedEventName;
+    currentEvent->date = selectedEventDate;
+    currentEvent->location = selectedEventLocation;
+    currentEvent->guestList = selectedEventGuests;
     currentEvent->budget = totalBudget;
     
     // Sync tasks
-    if (currentChecklistTasks) {
-        currentEvent->tasks.clear();
-        for (const char *task : *currentChecklistTasks) {
-            currentEvent->tasks.emplace_back(task);
-        }
-    } else if (currentDynamicTasks) {
+    if (currentDynamicTasks) {
         currentEvent->tasks = *currentDynamicTasks;
-    } else {
+    } else if (!currentEventTasks.empty()) {
         currentEvent->tasks = currentEventTasks;
     }
     currentEvent->taskCompleted = taskDone;
-    currentEvent->calendarTasks = calendarState.tasks;
-    currentEvent->budgetInputOption = budgetInputOption;
-    currentEvent->budgetInputLocked = budgetInputLocked;
-    currentEvent->spentBudget = spentBudget;
-
-    if (currentEvent->type == EventType::Birthday) {
-        currentEvent->selectedOption = static_cast<int>(selectedBirthdayOption);
-    } else if (currentEvent->type == EventType::Wedding) {
-        currentEvent->selectedOption = static_cast<int>(selectedWeddingOption);
-    } else if (currentEvent->type == EventType::Party) {
-        currentEvent->selectedOption = static_cast<int>(selectedPartyOption);
-    } else if (currentEvent->type == EventType::Conference) {
-        currentEvent->selectedOption = static_cast<int>(selectedConferenceOption);
-    } else if (currentEvent->type == EventType::Engagement) {
-        currentEvent->selectedOption = static_cast<int>(selectedEngagementOption);
-    }
     
     // Sync type-specific budgets
     if (currentEvent->type == EventType::Birthday) {
@@ -2383,12 +1654,7 @@ void syncAndSaveCurrentEvent() {
     
     // Update global budget
     totalBudget = currentEvent->budget;
-
-    std::string newFilename = getEventFilename(*currentEvent);
-    if (nameChanged && oldFilename != newFilename && std::filesystem::exists(oldFilename)) {
-        std::filesystem::remove(oldFilename);
-    }
-
+    
     saveEvent(*currentEvent);
 }
 
@@ -2408,8 +1674,6 @@ void SetPinkTheme()
     ImVec4 *colors = style.Colors;
 
     colors[ImGuiCol_WindowBg] = ImVec4(1.0f, 0.93f, 0.96f, 1.0f);
-    colors[ImGuiCol_PopupBg] = ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
-    colors[ImGuiCol_Border] = ImVec4(0.75f, 0.75f, 0.75f, 1.0f);
     colors[ImGuiCol_Button] = ImVec4(1.0f, 0.55f, 0.75f, 1.0f);
     colors[ImGuiCol_ButtonHovered] = ImVec4(1.0f, 0.65f, 0.82f, 1.0f);
     colors[ImGuiCol_ButtonActive] = ImVec4(1.0f, 0.45f, 0.70f, 1.0f);
@@ -2432,7 +1696,6 @@ void RenderEventDetailsPage()
 
         if (selectedPartyOption == PartyOption::None)
         {
-            bool optionChosen = false;
             ImGui::Text("Choose Party Option:");
             ImGui::Spacing();
 
@@ -2443,41 +1706,38 @@ void RenderEventDetailsPage()
                 partyMaxBudget = 10000.0f;
                 budgetRangeText = "Recommended budget: 6,000 - 10,000 EGP";
                 UpdateChecklistTasks(partyOption1Tasks);
-                optionChosen = true;
             }
             if (ImGui::Button("Mid")) {
                 selectedPartyOption = PartyOption::Option2;
                 selectedOptionName = "Mid";
                 partyMinBudget = 10000.0f;
-                partyMaxBudget = 15000.0f;
-                budgetRangeText = "Recommended budget: 10,000 - 15,000 EGP";
+                partyMaxBudget = 14000.0f;
+                budgetRangeText = "Recommended budget: 10,000 - 14,000 EGP";
                 UpdateChecklistTasks(partyOption2Tasks);
             }
             if (ImGui::Button("Premium")) {
                 selectedPartyOption = PartyOption::Option3;
                 selectedOptionName = "Premium";
                 partyMinBudget = 15000.0f;
-                partyMaxBudget = 24000.0f;
-                budgetRangeText = "Recommended budget: 15,000 - 24,000 EGP";
+                partyMaxBudget = 20000.0f;
+                budgetRangeText = "Recommended budget: 15,000 - 20,000 EGP";
                 UpdateChecklistTasks(partyOption3Tasks);
             }
             if (ImGui::Button("Deluxe")) {
                 selectedPartyOption = PartyOption::Option4;
                 selectedOptionName = "Deluxe";
                 partyMinBudget = 24000.0f;
-                partyMaxBudget = 38000.0f;
-                budgetRangeText = "Recommended budget: 24,000 - 38,000 EGP";
+                partyMaxBudget = 32000.0f;
+                budgetRangeText = "Recommended budget: 24,000 - 32,000 EGP";
                 UpdateChecklistTasks(partyOption4Tasks);
-                optionChosen = true;
             }
             if (ImGui::Button("Luxury")) {
                 selectedPartyOption = PartyOption::Option5;
                 selectedOptionName = "Luxury";
                 partyMinBudget = 38000.0f;
-                partyMaxBudget = 54000.0f;
-                budgetRangeText = "Recommended budget: 38,000 - 54,000 EGP";
+                partyMaxBudget = 46000.0f;
+                budgetRangeText = "Recommended budget: 38,000 - 46,000 EGP";
                 UpdateChecklistTasks(partyOption5Tasks);
-                optionChosen = true;
             }
             if (ImGui::Button("Ultra Luxury")) {
                 selectedPartyOption = PartyOption::Option6;
@@ -2486,10 +1746,6 @@ void RenderEventDetailsPage()
                 partyMaxBudget = 66000.0f;
                 budgetRangeText = "Recommended budget: 54,000 - 66,000 EGP";
                 UpdateChecklistTasks(partyOption6Tasks);
-                optionChosen = true;
-            }
-            if (selectedPartyOption != PartyOption::None) {
-                ClearSelectedEventDetailFields();
             }
         }
         else
@@ -2504,21 +1760,15 @@ void RenderEventDetailsPage()
             }
             ImGui::Spacing();
 
-            ImGui::Text("Event Name:");
-            ImGui::InputTextWithHint("##event_name", "e.g. My conf", selectedEventName, IM_ARRAYSIZE(selectedEventName));
-            ImGui::Text("Date:");
-            ImGui::InputTextWithHint("##event_date", "MM-DD-YYYY", selectedEventDate, IM_ARRAYSIZE(selectedEventDate));
-            ImGui::Text("Location:");
-            ImGui::InputTextWithHint("##event_location", "e.g. Cairo Conference Center", selectedEventLocation, IM_ARRAYSIZE(selectedEventLocation));
-            ImGui::Text("Guests:");
-            ImGui::InputTextWithHint("##event_guests", "e.g. 150 guests", selectedEventGuests, IM_ARRAYSIZE(selectedEventGuests));
+            ImGui::InputText("Date", selectedEventDate, IM_ARRAYSIZE(selectedEventDate));
+            ImGui::InputText("Location/Venue", selectedEventLocation, IM_ARRAYSIZE(selectedEventLocation));
+            ImGui::InputText("Number of Guests", selectedEventGuests, IM_ARRAYSIZE(selectedEventGuests));
             ImGui::Spacing();
             ImGui::Text("Remaining tasks for this option will appear in the dashboard checklist.");
             ImGui::Spacing();
             if (ImGui::Button("Change Option"))
             {
                 selectedPartyOption = PartyOption::None; // reset so user can re-choose
-                currentScreen = SCREEN_EVENT_OPTIONS;
             }
         }
     }
@@ -2532,10 +1782,49 @@ void RenderEventDetailsPage()
         // Step 1: Let user choose an option first
         if (selectedWeddingOption == WeddingOption::None)
         {
-            bool optionChosen = false;
             ImGui::Text("Choose Wedding Option:");
             ImGui::Spacing();
 
+            if (ImGui::Button("Ultra Luxury")) {
+                selectedWeddingOption = WeddingOption::Option1;
+                selectedOptionName = "Ultra Luxury";
+                weddingMinBudget = 9000000.0f;
+                weddingMaxBudget = 11000000.0f;
+                budgetRangeText = "Recommended budget: 9,000,000 - 11,000,000 EGP";
+                UpdateChecklistTasks(weddingOption1Tasks);
+            }
+            if (ImGui::Button("Luxury")) {
+                selectedWeddingOption = WeddingOption::Option2;
+                selectedOptionName = "Luxury";
+                weddingMinBudget = 5000000.0f;
+                weddingMaxBudget = 6000000.0f;
+                budgetRangeText = "Recommended budget: 5,000,000 - 6,000,000 EGP";
+                UpdateChecklistTasks(weddingOption2Tasks);
+            }
+            if (ImGui::Button("Premium")) {
+                selectedWeddingOption = WeddingOption::Option3;
+                selectedOptionName = "Premium";
+                weddingMinBudget = 2700000.0f;
+                weddingMaxBudget = 3300000.0f;
+                budgetRangeText = "Recommended budget: 2,700,000 - 3,300,000 EGP";
+                UpdateChecklistTasks(weddingOption3Tasks);
+            }
+            if (ImGui::Button("Mid")) {
+                selectedWeddingOption = WeddingOption::Option4;
+                selectedOptionName = "Mid";
+                weddingMinBudget = 1350000.0f;
+                weddingMaxBudget = 1650000.0f;
+                budgetRangeText = "Recommended budget: 1,350,000 - 1,650,000 EGP";
+                UpdateChecklistTasks(weddingOption4Tasks);
+            }
+            if (ImGui::Button("Budget")) {
+                selectedWeddingOption = WeddingOption::Option5;
+                selectedOptionName = "Budget";
+                weddingMinBudget = 720000.0f;
+                weddingMaxBudget = 880000.0f;
+                budgetRangeText = "Recommended budget: 720,000 - 880,000 EGP";
+                UpdateChecklistTasks(weddingOption5Tasks);
+            }
             if (ImGui::Button("Basic")) {
                 selectedWeddingOption = WeddingOption::Option6;
                 selectedOptionName = "Basic";
@@ -2543,53 +1832,6 @@ void RenderEventDetailsPage()
                 weddingMaxBudget = 165000.0f;
                 budgetRangeText = "Recommended budget: 135,000 - 165,000 EGP";
                 UpdateChecklistTasks(weddingOption6Tasks);
-                optionChosen = true;
-            }
-            if (ImGui::Button("Budget")) {
-                selectedWeddingOption = WeddingOption::Option5;
-                selectedOptionName = "Budget";
-                weddingMinBudget = 165000.0f;
-                weddingMaxBudget = 880000.0f;
-                budgetRangeText = "Recommended budget: 165,000 - 880,000 EGP";
-                UpdateChecklistTasks(weddingOption5Tasks);
-            }
-            if (ImGui::Button("Mid")) {
-                selectedWeddingOption = WeddingOption::Option4;
-                selectedOptionName = "Mid";
-                weddingMinBudget = 880000.0f;
-                weddingMaxBudget = 1650000.0f;
-                budgetRangeText = "Recommended budget: 880,000 - 1,650,000 EGP";
-                UpdateChecklistTasks(weddingOption4Tasks);
-            }
-            if (ImGui::Button("Premium")) {
-                selectedWeddingOption = WeddingOption::Option3;
-                selectedOptionName = "Premium";
-                weddingMinBudget = 1650000.0f;
-                weddingMaxBudget = 3300000.0f;
-                budgetRangeText = "Recommended budget: 1,650,000 - 3,300,000 EGP";
-                UpdateChecklistTasks(weddingOption3Tasks);
-                optionChosen = true;
-            }
-            if (ImGui::Button("Luxury")) {
-                selectedWeddingOption = WeddingOption::Option2;
-                selectedOptionName = "Luxury";
-                weddingMinBudget = 3300000.0f;
-                weddingMaxBudget = 6000000.0f;
-                budgetRangeText = "Recommended budget: 3,300,000 - 6,000,000 EGP";
-                UpdateChecklistTasks(weddingOption2Tasks);
-                optionChosen = true;
-            }
-            if (ImGui::Button("Ultra Luxury")) {
-                selectedWeddingOption = WeddingOption::Option1;
-                selectedOptionName = "Ultra Luxury";
-                weddingMinBudget = 6000000.0f;
-                weddingMaxBudget = 11000000.0f;
-                budgetRangeText = "Recommended budget: 6,000,000 - 11,000,000 EGP";
-                UpdateChecklistTasks(weddingOption1Tasks);
-                optionChosen = true;
-            }
-            if (selectedWeddingOption != WeddingOption::None) {
-                ClearSelectedEventDetailFields();
             }
         }
         else
@@ -2604,14 +1846,9 @@ void RenderEventDetailsPage()
             }
             ImGui::Spacing();
 
-            ImGui::Text("Event Name:");
-            ImGui::InputTextWithHint("##event_name", "e.g. My conf", selectedEventName, IM_ARRAYSIZE(selectedEventName));
-            ImGui::Text("Date:");
-            ImGui::InputTextWithHint("##event_date", "MM-DD-YYYY", selectedEventDate, IM_ARRAYSIZE(selectedEventDate));
-            ImGui::Text("Location:");
-            ImGui::InputTextWithHint("##event_location", "e.g. Cairo Conference Center", selectedEventLocation, IM_ARRAYSIZE(selectedEventLocation));
-            ImGui::Text("Guests:");
-            ImGui::InputTextWithHint("##event_guests", "e.g. 150 guests", selectedEventGuests, IM_ARRAYSIZE(selectedEventGuests));
+            ImGui::InputText("Date", selectedEventDate, IM_ARRAYSIZE(selectedEventDate));
+            ImGui::InputText("Location/Venue", selectedEventLocation, IM_ARRAYSIZE(selectedEventLocation));
+            ImGui::InputText("Number of Guests", selectedEventGuests, IM_ARRAYSIZE(selectedEventGuests));
             ImGui::Spacing();
             ImGui::Text("Remaining tasks for this option will appear in the dashboard checklist.");
 
@@ -2619,7 +1856,6 @@ void RenderEventDetailsPage()
             if (ImGui::Button("Change Option"))
             {
                 selectedWeddingOption = WeddingOption::None; // reset so user can re-choose
-                currentScreen = SCREEN_EVENT_OPTIONS;
             }
         }
     }
@@ -2632,7 +1868,6 @@ void RenderEventDetailsPage()
 
         if (selectedBirthdayOption == BirthdayOption::None)
         {
-            bool optionChosen = false;
             ImGui::Text("Choose Birthday Option:");
             ImGui::Spacing();
 
@@ -2643,55 +1878,46 @@ void RenderEventDetailsPage()
                 birthdayMaxBudget = 9000.0f;
                 budgetRangeText = "Recommended budget: 7,000 - 9,000 EGP";
                 UpdateChecklistTasks(birthdayOption1Tasks);
-                optionChosen = true;
             }
             if (ImGui::Button("Mid")) {
                 selectedBirthdayOption = BirthdayOption::Option2;
                 selectedOptionName = "Mid";
-                birthdayMinBudget = 9000.0f;
+                birthdayMinBudget = 11000.0f;
                 birthdayMaxBudget = 13000.0f;
-                budgetRangeText = "Recommended budget: 9,000 - 13,000 EGP";
+                budgetRangeText = "Recommended budget: 11,000 - 13,000 EGP";
                 UpdateChecklistTasks(birthdayOption2Tasks);
-                optionChosen = true;
             }
             if (ImGui::Button("Premium")) {
                 selectedBirthdayOption = BirthdayOption::Option3;
                 selectedOptionName = "Premium";
-                birthdayMinBudget = 13000.0f;
+                birthdayMinBudget = 16000.0f;
                 birthdayMaxBudget = 20000.0f;
-                budgetRangeText = "Recommended budget: 13,000 - 20,000 EGP";
+                budgetRangeText = "Recommended budget: 16,000 - 20,000 EGP";
                 UpdateChecklistTasks(birthdayOption3Tasks);
-                optionChosen = true;
             }
             if (ImGui::Button("Deluxe")) {
                 selectedBirthdayOption = BirthdayOption::Option4;
                 selectedOptionName = "Deluxe";
-                birthdayMinBudget = 20000.0f;
+                birthdayMinBudget = 25000.0f;
                 birthdayMaxBudget = 31000.0f;
-                budgetRangeText = "Recommended budget: 20,000 - 31,000 EGP";
+                budgetRangeText = "Recommended budget: 25,000 - 31,000 EGP";
                 UpdateChecklistTasks(birthdayOption4Tasks);
-                optionChosen = true;
             }
             if (ImGui::Button("Luxury")) {
                 selectedBirthdayOption = BirthdayOption::Option5;
                 selectedOptionName = "Luxury";
-                birthdayMinBudget = 31000.0f;
+                birthdayMinBudget = 39000.0f;
                 birthdayMaxBudget = 45000.0f;
-                budgetRangeText = "Recommended budget: 31,000 - 45,000 EGP";
+                budgetRangeText = "Recommended budget: 39,000 - 45,000 EGP";
                 UpdateChecklistTasks(birthdayOption5Tasks);
-                optionChosen = true;
             }
             if (ImGui::Button("Ultra Luxury")) {
                 selectedBirthdayOption = BirthdayOption::Option6;
                 selectedOptionName = "Ultra Luxury";
-                birthdayMinBudget = 45000.0f;
+                birthdayMinBudget = 54000.0f;
                 birthdayMaxBudget = 66000.0f;
-                budgetRangeText = "Recommended budget: 45,000 - 66,000 EGP";
+                budgetRangeText = "Recommended budget: 54,000 - 66,000 EGP";
                 UpdateChecklistTasks(birthdayOption6Tasks);
-                optionChosen = true;
-            }
-            if (selectedBirthdayOption != BirthdayOption::None) {
-                ClearSelectedEventDetailFields();
             }
         }
         else
@@ -2706,14 +1932,9 @@ void RenderEventDetailsPage()
             }
             ImGui::Spacing();
 
-            ImGui::Text("Event Name:");
-            ImGui::InputTextWithHint("##event_name", "e.g. My conf", selectedEventName, IM_ARRAYSIZE(selectedEventName));
-            ImGui::Text("Date:");
-            ImGui::InputTextWithHint("##event_date", "MM-DD-YYYY", selectedEventDate, IM_ARRAYSIZE(selectedEventDate));
-            ImGui::Text("Location:");
-            ImGui::InputTextWithHint("##event_location", "e.g. Cairo Conference Center", selectedEventLocation, IM_ARRAYSIZE(selectedEventLocation));
-            ImGui::Text("Guests:");
-            ImGui::InputTextWithHint("##event_guests", "e.g. 150 guests", selectedEventGuests, IM_ARRAYSIZE(selectedEventGuests));
+            ImGui::InputText("Date", selectedEventDate, IM_ARRAYSIZE(selectedEventDate));
+            ImGui::InputText("Location/Venue", selectedEventLocation, IM_ARRAYSIZE(selectedEventLocation));
+            ImGui::InputText("Number of Guests", selectedEventGuests, IM_ARRAYSIZE(selectedEventGuests));
             ImGui::Spacing();
             ImGui::Text("Remaining tasks for this option will appear in the dashboard checklist.");
 
@@ -2721,7 +1942,6 @@ void RenderEventDetailsPage()
             if (ImGui::Button("Change Option"))
             {
                 selectedBirthdayOption = BirthdayOption::None; // reset so user can re-choose
-                currentScreen = SCREEN_EVENT_OPTIONS;
             }
         }
     }
@@ -2734,54 +1954,48 @@ void RenderEventDetailsPage()
 
         if (selectedEngagementOption == EngagementOption::None)
         {
-            bool optionChosen = false;
             ImGui::Text("Choose Engagement Option:");
             ImGui::Spacing();
 
-            if (ImGui::Button("Budget")) {
+            if (ImGui::Button("Premium")) {
                 selectedEngagementOption = EngagementOption::Option1;
-                selectedOptionName = "Budget";
-                engagementMinBudget = 72000.0f;
-                engagementMaxBudget = 270000.0f;
-                budgetRangeText = "Recommended budget: 72,000 - 270,000 EGP";
+                selectedOptionName = "Premium";
+                engagementMinBudget = 1800000.0f;
+                engagementMaxBudget = 2200000.0f;
+                budgetRangeText = "Recommended budget: 1,800,000 - 2,200,000 EGP";
                 UpdateChecklistTasks(engagementOption1Tasks);
-                optionChosen = true;
             }
-            if (ImGui::Button("Basic")) {
+            if (ImGui::Button("Luxury")) {
                 selectedEngagementOption = EngagementOption::Option2;
-                selectedOptionName = "Basic";
-                engagementMinBudget = 270000.0f;
-                engagementMaxBudget = 540000.0f;
-                budgetRangeText = "Recommended budget: 270,000 - 540,000 EGP";
+                selectedOptionName = "Luxury";
+                engagementMinBudget = 900000.0f;
+                engagementMaxBudget = 1100000.0f;
+                budgetRangeText = "Recommended budget: 900,000 - 1,100,000 EGP";
                 UpdateChecklistTasks(engagementOption2Tasks);
             }
             if (ImGui::Button("Mid")) {
                 selectedEngagementOption = EngagementOption::Option3;
                 selectedOptionName = "Mid";
                 engagementMinBudget = 540000.0f;
-                engagementMaxBudget = 900000.0f;
-                budgetRangeText = "Recommended budget: 540,000 - 900,000 EGP";
+                engagementMaxBudget = 660000.0f;
+                budgetRangeText = "Recommended budget: 540,000 - 660,000 EGP";
                 UpdateChecklistTasks(engagementOption3Tasks);
             }
-            if (ImGui::Button("Luxury")) {
+            if (ImGui::Button("Basic")) {
                 selectedEngagementOption = EngagementOption::Option4;
-                selectedOptionName = "Luxury";
-                engagementMinBudget = 900000.0f;
-                engagementMaxBudget = 1800000.0f;
-                budgetRangeText = "Recommended budget: 900,000 - 1,800,000 EGP";
+                selectedOptionName = "Basic";
+                engagementMinBudget = 270000.0f;
+                engagementMaxBudget = 330000.0f;
+                budgetRangeText = "Recommended budget: 270,000 - 330,000 EGP";
                 UpdateChecklistTasks(engagementOption4Tasks);
             }
-            if (ImGui::Button("Premium")) {
+            if (ImGui::Button("Budget")) {
                 selectedEngagementOption = EngagementOption::Option5;
-                selectedOptionName = "Premium";
-                engagementMinBudget = 1800000.0f;
-                engagementMaxBudget = 2200000.0f;
-                budgetRangeText = "Recommended budget: 1,800,000 - 2,200,000 EGP";
+                selectedOptionName = "Budget";
+                engagementMinBudget = 72000.0f;
+                engagementMaxBudget = 88000.0f;
+                budgetRangeText = "Recommended budget: 72,000 - 88,000 EGP";
                 UpdateChecklistTasks(engagementOption5Tasks);
-                optionChosen = true;
-            }
-            if (selectedEngagementOption != EngagementOption::None) {
-                ClearSelectedEventDetailFields();
             }
         }
         else
@@ -2796,14 +2010,9 @@ void RenderEventDetailsPage()
             }
             ImGui::Spacing();
 
-            ImGui::Text("Event Name:");
-            ImGui::InputTextWithHint("##event_name", "e.g. My conf", selectedEventName, IM_ARRAYSIZE(selectedEventName));
-            ImGui::Text("Date:");
-            ImGui::InputTextWithHint("##event_date", "MM-DD-YYYY", selectedEventDate, IM_ARRAYSIZE(selectedEventDate));
-            ImGui::Text("Location:");
-            ImGui::InputTextWithHint("##event_location", "e.g. Cairo Conference Center", selectedEventLocation, IM_ARRAYSIZE(selectedEventLocation));
-            ImGui::Text("Guests:");
-            ImGui::InputTextWithHint("##event_guests", "e.g. 150 guests", selectedEventGuests, IM_ARRAYSIZE(selectedEventGuests));
+            ImGui::InputText("Date", selectedEventDate, IM_ARRAYSIZE(selectedEventDate));
+            ImGui::InputText("Location/Venue", selectedEventLocation, IM_ARRAYSIZE(selectedEventLocation));
+            ImGui::InputText("Number of Guests", selectedEventGuests, IM_ARRAYSIZE(selectedEventGuests));
             ImGui::Spacing();
             ImGui::Text("Remaining tasks for this option will appear in the dashboard checklist.");
 
@@ -2811,7 +2020,6 @@ void RenderEventDetailsPage()
             if (ImGui::Button("Change Option"))
             {
                 selectedEngagementOption = EngagementOption::None; // reset so user can re-choose
-                currentScreen = SCREEN_EVENT_OPTIONS;
             }
         }
     }
@@ -2824,7 +2032,6 @@ void RenderEventDetailsPage()
 
         if (selectedConferenceOption == ConferenceOption::None)
         {
-            bool optionChosen = false;
             ImGui::Text("Choose Conference Option:");
             ImGui::Spacing();
 
@@ -2835,7 +2042,6 @@ void RenderEventDetailsPage()
                 conferenceMaxBudget = 10000.0f;
                 budgetRangeText = "Recommended budget: 5,000 - 10,000 EGP";
                 UpdateChecklistTasks(conferenceOption1Tasks);
-                optionChosen = true;
             }
             if (ImGui::Button("Mid")) {
                 selectedConferenceOption = ConferenceOption::Option2;
@@ -2868,7 +2074,6 @@ void RenderEventDetailsPage()
                 conferenceMaxBudget = 100000.0f;
                 budgetRangeText = "Recommended budget: 70,000 - 100,000 EGP";
                 UpdateChecklistTasks(conferenceOption5Tasks);
-                optionChosen = true;
             }
             if (ImGui::Button("Elite")) {
                 selectedConferenceOption = ConferenceOption::Option6;
@@ -2877,10 +2082,6 @@ void RenderEventDetailsPage()
                 conferenceMaxBudget = 200000.0f;
                 budgetRangeText = "Recommended budget: 100,000 - 200,000 EGP";
                 UpdateChecklistTasks(conferenceOption6Tasks);
-                optionChosen = true;
-            }
-            if (selectedConferenceOption != ConferenceOption::None) {
-                ClearSelectedEventDetailFields();
             }
         }
         else
@@ -2895,14 +2096,9 @@ void RenderEventDetailsPage()
             }
             ImGui::Spacing();
 
-            ImGui::Text("Event Name:");
-            ImGui::InputTextWithHint("##event_name", "e.g. My conf", selectedEventName, IM_ARRAYSIZE(selectedEventName));
-            ImGui::Text("Date:");
-            ImGui::InputTextWithHint("##event_date", "MM-DD-YYYY", selectedEventDate, IM_ARRAYSIZE(selectedEventDate));
-            ImGui::Text("Location:");
-            ImGui::InputTextWithHint("##event_location", "e.g. Cairo Conference Center", selectedEventLocation, IM_ARRAYSIZE(selectedEventLocation));
-            ImGui::Text("Guests:");
-            ImGui::InputTextWithHint("##event_guests", "e.g. 150 guests", selectedEventGuests, IM_ARRAYSIZE(selectedEventGuests));
+            ImGui::InputText("Date", selectedEventDate, IM_ARRAYSIZE(selectedEventDate));
+            ImGui::InputText("Location/Venue", selectedEventLocation, IM_ARRAYSIZE(selectedEventLocation));
+            ImGui::InputText("Number of Guests", selectedEventGuests, IM_ARRAYSIZE(selectedEventGuests));
             ImGui::Spacing();
             ImGui::Text("Remaining tasks for this option will appear in the dashboard checklist.");
 
@@ -2910,7 +2106,6 @@ void RenderEventDetailsPage()
             if (ImGui::Button("Change Option"))
             {
                 selectedConferenceOption = ConferenceOption::None; // reset so user can re-choose
-                currentScreen = SCREEN_EVENT_OPTIONS;
             }
         }
     }
@@ -2935,16 +2130,15 @@ void RenderEventDetailsPage()
     }
     if (ImGui::Button("Go to Dashboard"))
     {
-        syncAndSaveCurrentEvent();
         currentScreen = SCREEN_DASHBOARD;
     }
     if (!canProceed) {
         ImGui::EndDisabled();
     }
 
-    if (ImGui::Button("Back to Main Menu"))
+    if (ImGui::Button("Back"))
     {
-        currentScreen = SCREEN_MAIN_MENU;
+        currentScreen = SCREEN_EVENT_OPTIONS;
     }
 
     ImGui::End();
@@ -2964,39 +2158,29 @@ void RenderBudgetSystem()
     ImGui::Separator();
     ImGui::Spacing();
 
-    float totalBudgetForEvent = totalBudget;
+    float totalBudgetForEvent = 0.0f;
     std::vector<std::pair<std::string, float>> *currentAllocation = nullptr;
 
     // Determine which budget and allocation to use
     if (selectedEvent == EventType::Birthday) {
-        if (birthdayBudget > 0.0f)
-            totalBudgetForEvent = birthdayBudget;
+        totalBudgetForEvent = birthdayBudget;
         if (selectedBirthdayOption != BirthdayOption::None) {
             currentAllocation = &birthdayBudgetAlloc.categories[(int)selectedBirthdayOption - 1];
         }
     } else if (selectedEvent == EventType::Wedding) {
-        if (weddingBudget > 0.0f)
-            totalBudgetForEvent = weddingBudget;
+        totalBudgetForEvent = weddingBudget;
         if (selectedWeddingOption != WeddingOption::None) {
             currentAllocation = &weddingBudgetAlloc.categories[(int)selectedWeddingOption - 1];
         }
     } else if (selectedEvent == EventType::Engagement) {
-        if (engagementBudget > 0.0f)
-            totalBudgetForEvent = engagementBudget;
+        totalBudgetForEvent = engagementBudget;
         if (selectedEngagementOption != EngagementOption::None) {
             currentAllocation = &engagementBudgetAlloc.categories[(int)selectedEngagementOption - 1];
         }
     } else if (selectedEvent == EventType::Party) {
-        if (partyBudget > 0.0f)
-            totalBudgetForEvent = partyBudget;
+        totalBudgetForEvent = partyBudget;
         if (selectedPartyOption != PartyOption::None) {
             currentAllocation = &partyBudgetAlloc.categories[(int)selectedPartyOption - 1];
-        }
-    } else if (selectedEvent == EventType::Conference) {
-        if (conferenceBudget > 0.0f)
-            totalBudgetForEvent = conferenceBudget;
-        if (selectedConferenceOption != ConferenceOption::None) {
-            currentAllocation = &conferenceBudgetAlloc.categories[(int)selectedConferenceOption - 1];
         }
     }
 
@@ -3007,7 +2191,7 @@ void RenderBudgetSystem()
         ImGui::TextColored(ImVec4(1, 1, 0, 1), "No allocation data available for this option.");
         ImGui::Spacing();
     } else {
-        ImGui::TextColored(ImVec4(0.55f, 0.0f, 0.30f, 1.0f), "Total Budget: %.0f EGP", totalBudgetForEvent);
+        ImGui::TextColored(ImVec4(0, 1, 0, 1), "Total Budget: %.0f EGP", totalBudgetForEvent);
         ImGui::Separator();
         ImGui::Spacing();
 
@@ -3017,11 +2201,11 @@ void RenderBudgetSystem()
         ImGui::SetColumnWidth(1, 100);
         ImGui::SetColumnWidth(2, 150);
 
-        ImGui::TextColored(ImVec4(0.55f, 0.0f, 0.30f, 1.0f), "Category");
+        ImGui::TextColored(ImVec4(1, 1, 0, 1), "Category");
         ImGui::NextColumn();
-        ImGui::TextColored(ImVec4(0.55f, 0.0f, 0.30f, 1.0f), "Percentage");
+        ImGui::TextColored(ImVec4(1, 1, 0, 1), "Percentage");
         ImGui::NextColumn();
-        ImGui::TextColored(ImVec4(0.55f, 0.0f, 0.30f, 1.0f), "Suggested Amount");
+        ImGui::TextColored(ImVec4(1, 1, 0, 1), "Suggested Amount");
         ImGui::NextColumn();
         ImGui::Separator();
 
@@ -3029,11 +2213,11 @@ void RenderBudgetSystem()
         for (const auto &item : *currentAllocation) {
             float suggestedAmount = (item.second / 100.0f) * totalBudgetForEvent;
             
-            ImGui::TextColored(ImVec4(0.55f, 0.0f, 0.30f, 1.0f), "%s", item.first.c_str());
+            ImGui::Text("%s", item.first.c_str());
             ImGui::NextColumn();
-            ImGui::TextColored(ImVec4(0.55f, 0.0f, 0.30f, 1.0f), "%.1f%%", item.second);
+            ImGui::Text("%.1f%%", item.second);
             ImGui::NextColumn();
-            ImGui::TextColored(ImVec4(0.55f, 0.0f, 0.30f, 1.0f), "%.0f EGP", suggestedAmount);
+            ImGui::TextColored(ImVec4(0, 1, 1, 1), "%.0f EGP", suggestedAmount);
             ImGui::NextColumn();
         }
 
@@ -3047,17 +2231,6 @@ void RenderBudgetSystem()
 
     if (ImGui::Button("Back to Dashboard", ImVec2(200, 0))) {
         currentScreen = SCREEN_DASHBOARD;
-    }
-
-    ImGui::Spacing();
-    ImGui::SetCursorPosX((ImGui::GetWindowWidth() - 80) * 0.5f);
-    if (ImGui::Button("Logout", ImVec2(80, 25)))
-    {
-        currentUsername = "";
-        savedEvents.clear();
-        currentEvent = nullptr;
-        selectedEvent = EventType::None;
-        currentScreen = SCREEN_LOGIN;
     }
 
     ImGui::End();
@@ -3078,6 +2251,8 @@ void RenderDashboard()
     static char budgetBreakdown1[100] = "";
     static char budgetBreakdown2[100] = "";
     static char budgetBreakdown3[100] = "";
+    static bool budgetInputOption1 = true; // true = counter, false = direct input
+    static float budgetSpentOption2 = 0.0f;
     static float manualStressLevel = 2.0f; // 0=not stressed, 1=mild, 2=neutral, 3=very stressed, 4=extremely stressed
     
     // Motivational messages based on progress
@@ -3188,10 +2363,8 @@ void RenderDashboard()
         for (size_t i = 0; i < currentChecklistTasks->size(); i++)
         {
             bool done = taskDone[i];
-            if (ImGui::Checkbox((*currentChecklistTasks)[i], &done)) {
+            if (ImGui::Checkbox((*currentChecklistTasks)[i], &done))
                 taskDone[i] = done;
-                syncAndSaveCurrentEvent();
-            }
             if (taskDone[i])
                 completed++;
         }
@@ -3207,10 +2380,8 @@ void RenderDashboard()
         for (size_t i = 0; i < currentDynamicTasks->size(); i++)
         {
             bool done = taskDone[i];
-            if (ImGui::Checkbox((*currentDynamicTasks)[i].c_str(), &done)) {
+            if (ImGui::Checkbox((*currentDynamicTasks)[i].c_str(), &done))
                 taskDone[i] = done;
-                syncAndSaveCurrentEvent();
-            }
             if (taskDone[i])
                 completed++;
         }
@@ -3221,10 +2392,8 @@ void RenderDashboard()
         {
             bool done = taskDone[i];
             std::string label = std::to_string(i + 1);
-            if (ImGui::Checkbox(label.c_str(), &done)) {
+            if (ImGui::Checkbox(label.c_str(), &done))
                 taskDone[i] = done;
-                syncAndSaveCurrentEvent();
-            }
             if (taskDone[i])
                 completed++;
         }
@@ -3287,122 +2456,46 @@ void RenderDashboard()
         displayBudget = engagementBudget;
     else if (selectedEvent == EventType::Conference && conferenceBudget > 0.0f)
         displayBudget = conferenceBudget;
-
-    if (budgetInputOption != 0)
-    {
-        ImGui::Text("Total Budget: %.0f", displayBudget);
-
-        if (budgetInputOption == 2)
-        {
-            float completedPercent = 0.0f;
-            std::vector<std::pair<std::string, float>> *currentAllocation = nullptr;
-            if (selectedEvent == EventType::Birthday && selectedBirthdayOption != BirthdayOption::None)
-                currentAllocation = &birthdayBudgetAlloc.categories[(int)selectedBirthdayOption - 1];
-            else if (selectedEvent == EventType::Wedding && selectedWeddingOption != WeddingOption::None)
-                currentAllocation = &weddingBudgetAlloc.categories[(int)selectedWeddingOption - 1];
-            else if (selectedEvent == EventType::Engagement && selectedEngagementOption != EngagementOption::None)
-                currentAllocation = &engagementBudgetAlloc.categories[(int)selectedEngagementOption - 1];
-            else if (selectedEvent == EventType::Party && selectedPartyOption != PartyOption::None)
-                currentAllocation = &partyBudgetAlloc.categories[(int)selectedPartyOption - 1];
-            else if (selectedEvent == EventType::Conference && selectedConferenceOption != ConferenceOption::None)
-                currentAllocation = &conferenceBudgetAlloc.categories[(int)selectedConferenceOption - 1];
-
-            if (currentAllocation && !currentAllocation->empty())
-            {
-                std::vector<std::string> tasks;
-                if (currentChecklistTasks && !currentChecklistTasks->empty())
-                {
-                    tasks.assign(currentChecklistTasks->begin(), currentChecklistTasks->end());
-                }
-                else if (currentDynamicTasks && !currentDynamicTasks->empty())
-                {
-                    tasks = *currentDynamicTasks;
-                }
-
-                if (!tasks.empty() && taskDone.size() == tasks.size())
-                {
-                    float completedPercent = CalculateCompletedBudgetPercent(tasks, taskDone, *currentAllocation);
-                    spentBudget = (completedPercent / 100.0f) * displayBudget;
-                }
-                else
-                {
-                    spentBudget = 0.0f;
-                }
-            }
-        }
-
-        ImGui::Text("Spent: %.0f", spentBudget);
-    }
-    else
-    {
-        ImGui::TextWrapped("Choose a budget tracking mode above to see totals here.");
-    }
-
+    
+    ImGui::Text("Total Budget: %.0f", displayBudget);
+    ImGui::Text("Spent: %.0f", spentBudget);
+    
     ImGui::Spacing();
     ImGui::Separator();
-    if (!budgetInputLocked)
+    ImGui::Text("Budget Input Methods:");
+    
+    if (ImGui::RadioButton("Option 1: Counter Button", budgetInputOption1))
+        budgetInputOption1 = true;
+    
+    ImGui::SameLine();
+    
+    if (ImGui::RadioButton("Option 2: Direct Input", !budgetInputOption1))
+        budgetInputOption1 = false;
+    
+    ImGui::Spacing();
+    
+    if (budgetInputOption1)
     {
-        ImGui::Text("Pick a budget mode");
-        ImGui::TextWrapped("Select one option to continue.");
-        ImGui::Spacing();
-
-        if (ImGui::Button("Manual Spent Amount", ImVec2(270, 30)))
-        {
-            budgetInputOption = 1;
-            budgetInputLocked = true;
-            budgetSpentOption1 = spentBudget;
-            syncAndSaveCurrentEvent();
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Task-Based Percentages", ImVec2(270, 30)))
-        {
-            budgetInputOption = 2;
-            budgetInputLocked = true;
-            budgetSpentOption2 = 0.0f;
-            spentBudget = 0.0f;
-            syncAndSaveCurrentEvent();
-        }
-
-        ImGui::Spacing();
-        ImGui::TextWrapped("Option 1 = manual entry. Option 2 = auto estimate from completed tasks.");
+        ImGui::InputFloat("Update Spent Amount##option1", &spentBudget, 100.0f, 1000.0f, "%.0f");
     }
     else
     {
-        ImGui::Separator();
-        if (budgetInputOption == 1)
-        {
-            ImGui::Text("Manual mode selected");
-            ImGui::TextWrapped("Enter the amount you have spent.");
-            if (ImGui::InputFloat("Update Spent Amount##option1", &spentBudget, 100.0f, 1000.0f, "%.0f"))
-            {
-                syncAndSaveCurrentEvent();
-            }
-        }
-        else if (budgetInputOption == 2)
-        {
-            ImGui::Text("Task-based mode selected");
-            ImGui::TextWrapped("Budget updates as you complete tasks.");
-        }
-
+        ImGui::InputFloat("Spent Amount##option2", &budgetSpentOption2, 100.0f, 1000.0f, "%.0f");
         ImGui::Spacing();
-        if (ImGui::Button("Change Input Option", ImVec2(-1, 0)))
+        if (ImGui::Button("Update Budget from Option 2", ImVec2(-1, 0)))
         {
-            budgetInputLocked = false;
-            budgetInputOption = 0;
-            budgetSpentOption2 = 0.0f;
-            spentBudget = 0.0f;
-            syncAndSaveCurrentEvent();
+            spentBudget = budgetSpentOption2;
         }
     }
-
-    ImGui::Spacing();
+    
+    ImGui::Text("Remaining: %.0f", displayBudget - spentBudget);
     ImGui::Separator();
     
-    if (ImGui::Button("View Budget System Details", ImVec2(-1, 0))) {
+    if (ImGui::Button("Budget System", ImVec2(-1, 0))) {
         currentScreen = SCREEN_BUDGET_SYSTEM;
     }
     ImGui::Spacing();
-    ImGui::TextWrapped("Press this to see a clear breakdown of how your event budget is allocated across categories.");
+    ImGui::Text("Click to see detailed budget allocation suggestions");
     
     ImGui::EndChild();
     ImGui::PopStyleColor();
@@ -3431,40 +2524,7 @@ void RenderDashboard()
 
     ImGui::Spacing();
 
-    if (budgetInputOption == 2 && displayBudget > 0.0f)
-    {
-        std::vector<std::pair<std::string, float>> *currentAllocation = nullptr;
-        if (selectedEvent == EventType::Birthday && selectedBirthdayOption != BirthdayOption::None)
-            currentAllocation = &birthdayBudgetAlloc.categories[(int)selectedBirthdayOption - 1];
-        else if (selectedEvent == EventType::Wedding && selectedWeddingOption != WeddingOption::None)
-            currentAllocation = &weddingBudgetAlloc.categories[(int)selectedWeddingOption - 1];
-        else if (selectedEvent == EventType::Engagement && selectedEngagementOption != EngagementOption::None)
-            currentAllocation = &engagementBudgetAlloc.categories[(int)selectedEngagementOption - 1];
-        else if (selectedEvent == EventType::Party && selectedPartyOption != PartyOption::None)
-            currentAllocation = &partyBudgetAlloc.categories[(int)selectedPartyOption - 1];
-        else if (selectedEvent == EventType::Conference && selectedConferenceOption != ConferenceOption::None)
-            currentAllocation = &conferenceBudgetAlloc.categories[(int)selectedConferenceOption - 1];
-
-        if (currentAllocation && !currentAllocation->empty())
-        {
-            std::vector<std::string> tasks;
-            if (currentChecklistTasks && !currentChecklistTasks->empty())
-                tasks.assign(currentChecklistTasks->begin(), currentChecklistTasks->end());
-            else if (currentDynamicTasks && !currentDynamicTasks->empty())
-                tasks = *currentDynamicTasks;
-
-            if (!tasks.empty() && taskDone.size() == tasks.size())
-            {
-                float completedPercent = CalculateCompletedBudgetPercent(tasks, taskDone, *currentAllocation);
-                spentBudget = (completedPercent / 100.0f) * displayBudget;
-            }
-            else
-            {
-                spentBudget = 0.0f;
-            }
-        }
-    }
-
+    // Budget progress
     float budgetProgress = displayBudget > 0 ? spentBudget / displayBudget * 100.0f : 0.0f;
     ImGui::Text("Budget Progress: %.1f%% (%.0f/%.0f)", budgetProgress, spentBudget, displayBudget);
     ImGui::ProgressBar(budgetProgress / 100.0f);
@@ -3512,37 +2572,11 @@ void RenderDashboard()
     ImGui::Separator();
     ImGui::Spacing();
 
-    ImGui::BeginChild("dashboard_actions", ImVec2(0, 60), false, ImGuiWindowFlags_NoScrollbar);
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.25f, 0.95f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.65f, 0.35f, 1.0f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.45f, 0.15f, 0.85f, 1.0f));
-    if (ImGui::Button("Create another event", ImVec2(220, 40))) {
-        syncAndSaveCurrentEvent();
-        currentEvent = nullptr;
-        selectedEvent = EventType::None;
-        currentScreen = SCREEN_EVENT_SELECTION;
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("See existing events", ImVec2(220, 40))) {
-        syncAndSaveCurrentEvent();
-        loadEvents();
-        currentScreen = SCREEN_EVENT_LIST;
-    }
-    ImGui::PopStyleColor(3);
-    ImGui::EndChild();
-
-    ImGui::Spacing();
-    ImGui::Separator();
-    ImGui::Spacing();
-
     ImGui::EndTabItem();
     }
     
     if (ImGui::BeginTabItem("Weekly Calendar"))
     {
-        // Create a child window for the calendar to ensure proper layout and prevent overlap
-        ImGui::BeginChild("CalendarContainer", ImVec2(0, -50), false);
-        
         // Calendar grid rendering
         ImVec2 windowSize = ImGui::GetContentRegionAvail();
         float cellWidth = (windowSize.x - 80.0f) / 7.0f;
@@ -3551,7 +2585,6 @@ void RenderDashboard()
 
         if (ImGui::Button("+ New Task##Dashboard", ImVec2(140.0f, 0)))
         {
-            ResetCalendarModalState(calendarState);
             calendarState.showCreateModal = true;
             calendarState.modalDayOfWeek = 0;
             calendarState.modalStartHour = 9;
@@ -3590,164 +2623,7 @@ void RenderDashboard()
         
         // Task modal
         RenderCalendarTaskModal(calendarState);
-        
-        ImGui::EndChild();
-        
-        // Add back button at the bottom with proper positioning
-        ImGui::Spacing();
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(1.0f, 0.75f, 0.85f, 1.0f));
-        if (ImGui::Button("Back to Event Details", ImVec2(-1, 0)))
-        {
-            currentScreen = SCREEN_EVENT_DETAILS;
-        }
-        ImGui::PopStyleColor();
 
-        ImGui::EndTabItem();
-    }
-    
-    // ===== CHATBOT TAB =====
-    if (ImGui::BeginTabItem("Chatbot"))
-    {
-        ImGui::Text("Event Planning AI Assistant");
-        ImGui::Separator();
-        ImGui::Spacing();
-        
-        // Chat history display
-        ImGui::BeginChild("ChatHistory", ImVec2(0, ImGui::GetWindowHeight() - 150), true, ImGuiWindowFlags_AlwaysVerticalScrollbar);
-        
-        for (const auto &msg : chatHistory)
-        {
-            if (msg.role == "user")
-            {
-                ImGui::TextColored(ImVec4(0.2f, 0.6f, 1.0f, 1.0f), "You:");
-            }
-            else
-            {
-                ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.6f, 1.0f), "Assistant:");
-            }
-            
-            // Wrap text for long messages
-            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ImGui::GetWindowWidth() - 40);
-            ImGui::TextWrapped("%s", msg.content.c_str());
-            ImGui::PopTextWrapPos();
-            ImGui::Spacing();
-        }
-        
-        // Show current response if waiting
-        if (chatWaitingForResponse)
-        {
-            ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.6f, 1.0f), "Assistant (typing...):");
-            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ImGui::GetWindowWidth() - 40);
-            ImGui::TextWrapped("%s", chatCurrentResponse.c_str());
-            ImGui::PopTextWrapPos();
-        }
-        
-        ImGui::EndChild();
-        
-        // Input area
-        ImGui::Spacing();
-        ImGui::InputTextMultiline("##ChatInput", chatInputBuffer, IM_ARRAYSIZE(chatInputBuffer), ImVec2(-120, 60), ImGuiInputTextFlags_AllowTabInput);
-        ImGui::SameLine();
-        
-        ImGui::BeginGroup();
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.6f, 1.0f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3f, 0.7f, 1.0f, 1.0f));
-        
-        if (!chatWaitingForResponse && ImGui::Button("Send", ImVec2(-1, 27)))
-        {
-            std::string userMessage(chatInputBuffer);
-            if (!userMessage.empty())
-            {
-                // Add user message to history
-                {
-                    std::lock_guard<std::mutex> lock(chatMutex);
-                    chatHistory.push_back({"user", userMessage});
-                    SaveChatHistory();
-                }
-                
-                // Clear input and set waiting state
-                memset(chatInputBuffer, 0, sizeof(chatInputBuffer));
-                chatWaitingForResponse = true;
-                chatCurrentResponse = "";
-                
-                // Call ollama in a separate thread
-                std::thread ollama_thread([userMessage]() {
-                    // Build the curl command
-                    std::string escapedMessage = userMessage;
-                    // Escape special characters for shell
-                    size_t pos = 0;
-                    while ((pos = escapedMessage.find("\"", pos)) != std::string::npos) {
-                        escapedMessage.replace(pos, 1, "\\\"");
-                        pos += 2;
-                    }
-                    
-                    std::string command = "curl -s http://localhost:11434/api/generate -d '{\"model\":\"mistral\",\"prompt\":\"" + escapedMessage + "\",\"stream\":false}' 2>/dev/null";
-                    
-                    FILE *pipe = popen(command.c_str(), "r");
-                    if (pipe)
-                    {
-                        std::string response;
-                        char buffer[128];
-                        while (fgets(buffer, sizeof(buffer), pipe) != nullptr)
-                        {
-                            response += buffer;
-                        }
-                        pclose(pipe);
-                        
-                        // Parse JSON response to extract "response" field
-                        size_t responsePos = response.find("\"response\":\"");
-                        if (responsePos != std::string::npos)
-                        {
-                            size_t startPos = responsePos + 12;
-                            size_t endPos = response.find("\"", startPos);
-                            if (endPos != std::string::npos)
-                            {
-                                std::string extractedResponse = response.substr(startPos, endPos - startPos);
-                                
-                                // Unescape newlines in response
-                                size_t nlPos = 0;
-                                while ((nlPos = extractedResponse.find("\\n", nlPos)) != std::string::npos)
-                                {
-                                    extractedResponse.replace(nlPos, 2, "\n");
-                                    nlPos += 1;
-                                }
-                                
-                                {
-                                    std::lock_guard<std::mutex> lock(chatMutex);
-                                    chatCurrentResponse = extractedResponse;
-                                }
-                            }
-                        }
-                    }
-                    
-                    // Move response to history and reset state
-                    {
-                        std::lock_guard<std::mutex> lock(chatMutex);
-                        if (!chatCurrentResponse.empty())
-                        {
-                            chatHistory.push_back({"assistant", chatCurrentResponse});
-                        }
-                        chatWaitingForResponse = false;
-                        chatCurrentResponse = "";
-                    }
-                });
-                ollama_thread.detach();
-            }
-        }
-        
-        ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(1.0f, 0.4f, 0.4f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.0f, 0.5f, 0.5f, 1.0f));
-        if (ImGui::Button("Clear", ImVec2(-1, 27)))
-        {
-            chatHistory.clear();
-            SaveChatHistory();
-            chatCurrentResponse = "";
-            memset(chatInputBuffer, 0, sizeof(chatInputBuffer));
-        }
-        ImGui::PopStyleColor(4);
-        ImGui::EndGroup();
-        
         ImGui::EndTabItem();
     }
     
@@ -3757,15 +2633,9 @@ void RenderDashboard()
     ImGui::Separator();
     ImGui::Spacing();
 
-    // Logout button at bottom center
-    ImGui::SetCursorPosX((ImGui::GetWindowWidth() - 80) * 0.5f);
-    if (ImGui::Button("Logout", ImVec2(80, 25)))
+    if (ImGui::Button("Back to Event Details", ImVec2(200, 40)))
     {
-        currentUsername = "";
-        savedEvents.clear();
-        currentEvent = nullptr;
-        selectedEvent = EventType::None;
-        currentScreen = SCREEN_LOGIN;
+        currentScreen = SCREEN_EVENT_DETAILS;
     }
 
     ImGui::End();
@@ -3790,19 +2660,9 @@ int main()
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
     glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
 
-    GLFWmonitor *primaryMonitor = glfwGetPrimaryMonitor();
-    const GLFWvidmode *mode = glfwGetVideoMode(primaryMonitor);
-    int windowWidth = 1920;
-    int windowHeight = 1080;
-    if (mode)
-    {
-        windowWidth = mode->width;
-        windowHeight = mode->height;
-    }
-
     GLFWwindow *window = glfwCreateWindow(
-        windowWidth,
-        windowHeight,
+        1920,
+        1080,
         "Eventopia",
         NULL,
         NULL);
@@ -3812,8 +2672,6 @@ int main()
         glfwTerminate();
         return 1;
     }
-
-    glfwMaximizeWindow(window);
 
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);
@@ -3843,16 +2701,11 @@ int main()
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init(glsl_version);
 
-    LoadChatHistory();
     (void)io;
 
     backgroundTexture = LoadTexture("/Users/ahmedabdelbadie/Downloads/balloon-desktop-wallpaper_862994-352504 copy.png");
     if (backgroundTexture == 0)
         printf("Warning: could not load login background image.\n");
-
-    pageBackgroundTexture = LoadTexture("/Users/ahmedabdelbadie/Desktop/myapp 2/confetti_real.png");
-    if (pageBackgroundTexture == 0)
-        printf("Warning: could not load app page background image.\n");
 
     while (!glfwWindowShouldClose(window))
     {
@@ -3862,24 +2715,6 @@ int main()
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
         float window_width = io.DisplaySize.x;
-
-        if (pageBackgroundTexture != 0 &&
-            (currentScreen == SCREEN_APP ||
-             currentScreen == SCREEN_MAIN_MENU ||
-             currentScreen == SCREEN_EVENT_TYPE ||
-             currentScreen == SCREEN_EVENT_DETAILS ||
-             currentScreen == SCREEN_EVENT_SELECTION ||
-             currentScreen == SCREEN_EVENT_OPTIONS ||
-             currentScreen == SCREEN_EVENT_LIST ||
-             currentScreen == SCREEN_EVENT_BASIC_DETAILS))
-        {
-            ImGui::GetBackgroundDrawList()->AddImage(
-                reinterpret_cast<void *>(static_cast<intptr_t>(pageBackgroundTexture)),
-                ImVec2(0, 0),
-                io.DisplaySize,
-                ImVec2(0, 0),
-                ImVec2(1, 1));
-        }
 
         // ================= LOGIN =================
 
@@ -3962,7 +2797,6 @@ int main()
                 if (accountExists(username, password))
                 {
                     loginMessage = "Login successful!";
-                    currentUsername = username;
                     std::ifstream file(std::string(username) + "_event.txt");
                     if (file.is_open())
                     {
@@ -4099,15 +2933,8 @@ int main()
                 message =
                     "Account created successfully!";
 
-                currentUsername = newUsername;
-                std::filesystem::create_directories(getCurrentUserEventsDirectory());
-
                 strcpy(newUsername, "");
                 strcpy(newPassword, "");
-
-                currentEvent = nullptr;
-                selectedEvent = EventType::None;
-                savedEvents.clear();
 
                 currentScreen = SCREEN_MAIN_MENU;
             }
@@ -4146,7 +2973,6 @@ int main()
 
         else if (currentScreen == SCREEN_MAIN_MENU)
         {
-            static bool showNoExistingEventsMessage = false;
             loadEvents(); // Load saved events
             
             ImGui::SetNextWindowPos(ImVec2((ImGui::GetIO().DisplaySize.x - 500) / 2, (ImGui::GetIO().DisplaySize.y - 400) / 2));
@@ -4166,7 +2992,6 @@ int main()
             {
                 currentEvent = nullptr;
                 selectedEvent = EventType::None;
-                showNoExistingEventsMessage = false;
                 currentScreen = SCREEN_EVENT_SELECTION;
             }
             
@@ -4174,29 +2999,12 @@ int main()
             {
                 if (!savedEvents.empty())
                 {
-                    showNoExistingEventsMessage = false;
                     currentScreen = SCREEN_EVENT_LIST;
                 }
                 else
                 {
-                    showNoExistingEventsMessage = true;
+                    ImGui::Text("No existing events found.");
                 }
-            }
-
-            if (showNoExistingEventsMessage)
-            {
-                ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "No existing events found.");
-            }
-            
-            ImGui::Spacing();
-            ImGui::SetCursorPosX((500 - 80) * 0.5f); // Center the small button
-            if (ImGui::Button("Logout", ImVec2(80, 25)))
-            {
-                currentUsername = "";
-                savedEvents.clear();
-                currentEvent = nullptr;
-                selectedEvent = EventType::None;
-                currentScreen = SCREEN_LOGIN;
             }
             
             ImGui::PopFont();
@@ -4220,12 +3028,7 @@ int main()
             ImGui::SetWindowFontScale(1.2f);
             ImGui::Text("Select Event Type:");
             ImGui::SetWindowFontScale(1.0f);
-            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(14.0f, 14.0f));
-            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 15.0f);
-            ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(1.0f, 0.78f, 0.96f, 0.55f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.0f, 0.78f, 0.95f, 1.0f));
-
-            if (ImGui::Button("Party", ImVec2(350, 60)))
+            if (ImGui::Button("Party", ImVec2(350, 40)))
             {
                 selectedEvent = EventType::Party;
                 ResetEventOptionState();
@@ -4236,10 +3039,7 @@ int main()
                 taskDaysLeft.clear();
                 currentScreen = SCREEN_EVENT_OPTIONS;
             }
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Casual, fun, and colorful party planning.");
-
-            if (ImGui::Button("Wedding", ImVec2(350, 60)))
+            if (ImGui::Button("Wedding", ImVec2(350, 40)))
             {
                 selectedEvent = EventType::Wedding;
                 ResetEventOptionState();
@@ -4250,10 +3050,7 @@ int main()
                 taskDaysLeft.clear();
                 currentScreen = SCREEN_EVENT_OPTIONS;
             }
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("A classic full-wedding planning experience.");
-
-            if (ImGui::Button("Birthday", ImVec2(350, 60)))
+            if (ImGui::Button("Birthday", ImVec2(350, 40)))
             {
                 selectedEvent = EventType::Birthday;
                 ResetEventOptionState();
@@ -4264,10 +3061,7 @@ int main()
                 taskDaysLeft.clear();
                 currentScreen = SCREEN_EVENT_OPTIONS;
             }
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Plan an unforgettable birthday celebration.");
-
-            if (ImGui::Button("Conference", ImVec2(350, 60)))
+            if (ImGui::Button("Conference", ImVec2(350, 40)))
             {
                 selectedEvent = EventType::Conference;
                 ResetEventOptionState();
@@ -4278,10 +3072,7 @@ int main()
                 taskDaysLeft.clear();
                 currentScreen = SCREEN_EVENT_OPTIONS;
             }
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Organize a professional conference or meeting.");
-
-            if (ImGui::Button("Engagement", ImVec2(350, 60)))
+            if (ImGui::Button("Engagement", ImVec2(350, 40)))
             {
                 selectedEvent = EventType::Engagement;
                 ResetEventOptionState();
@@ -4292,11 +3083,6 @@ int main()
                 taskDaysLeft.clear();
                 currentScreen = SCREEN_EVENT_OPTIONS;
             }
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Plan a romantic engagement celebration.");
-
-            ImGui::PopStyleColor(2);
-            ImGui::PopStyleVar(2);
 
             ImGui::Spacing();
             ImGui::Separator();
@@ -4305,17 +3091,6 @@ int main()
             if (ImGui::Button("Back to Home", ImVec2(160.0f, 35.0f)))
             {
                 currentScreen = SCREEN_MAIN_MENU;
-            }
-
-            ImGui::Spacing();
-            ImGui::SetCursorPosX((400 - 80) * 0.5f); // Center the small button
-            if (ImGui::Button("Logout", ImVec2(80, 25)))
-            {
-                currentUsername = "";
-                savedEvents.clear();
-                currentEvent = nullptr;
-                selectedEvent = EventType::None;
-                currentScreen = SCREEN_LOGIN;
             }
 
             ImGui::PopFont();
@@ -4371,27 +3146,27 @@ int main()
             {
                 if (ImGui::Button("Basic", ImVec2(350, 40)))
                 {
-                    CreateEventWithOption(6, 135000.0f, "New Wedding Event");
-                }
-                if (ImGui::Button("Budget", ImVec2(350, 40)))
-                {
-                    CreateEventWithOption(5, 165000.0f, "New Wedding Event");
+                    CreateEventWithOption(1, 20000.0f, "New Wedding Event");
                 }
                 if (ImGui::Button("Mid", ImVec2(350, 40)))
                 {
-                    CreateEventWithOption(4, 880000.0f, "New Wedding Event");
+                    CreateEventWithOption(2, 50000.0f, "New Wedding Event");
                 }
                 if (ImGui::Button("Premium", ImVec2(350, 40)))
                 {
-                    CreateEventWithOption(3, 1650000.0f, "New Wedding Event");
+                    CreateEventWithOption(3, 80000.0f, "New Wedding Event");
+                }
+                if (ImGui::Button("Deluxe", ImVec2(350, 40)))
+                {
+                    CreateEventWithOption(4, 100000.0f, "New Wedding Event");
                 }
                 if (ImGui::Button("Luxury", ImVec2(350, 40)))
                 {
-                    CreateEventWithOption(2, 3300000.0f, "New Wedding Event");
+                    CreateEventWithOption(5, 150000.0f, "New Wedding Event");
                 }
-                if (ImGui::Button("Ultra Luxury", ImVec2(350, 40)))
+                if (ImGui::Button("Elite Luxury", ImVec2(350, 40)))
                 {
-                    CreateEventWithOption(1, 6000000.0f, "New Wedding Event");
+                    CreateEventWithOption(6, 200000.0f, "New Wedding Event");
                 }
             }
             else if (selectedEvent == EventType::Party)
@@ -4472,20 +3247,9 @@ int main()
             ImGui::Separator();
             ImGui::Spacing();
 
-            if (ImGui::Button("Back to Main Menu", ImVec2(200.0f, 35.0f)))
+            if (ImGui::Button("Back to Event Type", ImVec2(200.0f, 35.0f)))
             {
-                currentScreen = SCREEN_MAIN_MENU;
-            }
-
-            ImGui::Spacing();
-            ImGui::SetCursorPosX((400 - 80) * 0.5f); // Center the small button
-            if (ImGui::Button("Logout", ImVec2(80, 25)))
-            {
-                currentUsername = "";
-                savedEvents.clear();
-                currentEvent = nullptr;
-                selectedEvent = EventType::None;
-                currentScreen = SCREEN_LOGIN;
+                currentScreen = SCREEN_EVENT_TYPE;
             }
 
             ImGui::PopFont();
@@ -4511,12 +3275,10 @@ int main()
             ImGui::SetWindowFontScale(1.0f);
             ImGui::Separator();
             
-            for (size_t i = 0; i < savedEvents.size(); ) {
-                auto &event = savedEvents[i];
+            for (size_t i = 0; i < savedEvents.size(); ++i) {
+                const auto& event = savedEvents[i];
                 std::string buttonText = event.name + " (" + event.date + ")";
-                ImGui::PushID((int)i);
-
-                if (ImGui::Button(buttonText.c_str(), ImVec2(430, 40))) {
+                if (ImGui::Button(buttonText.c_str(), ImVec2(550, 40))) {
                     currentEvent = &savedEvents[i];
                     selectedEvent = event.type;
                     
@@ -4542,12 +3304,7 @@ int main()
                     strcpy(selectedEventLocation, event.location.c_str());
                     strcpy(selectedEventGuests, event.guestList.c_str());
                     totalBudget = event.budget;
-                    budgetInputOption = event.budgetInputOption;
-                    budgetInputLocked = event.budgetInputLocked;
-                    spentBudget = event.spentBudget;
-                    
-                    // Set selected option label
-                    UpdateSelectedOptionName();
+                    spentBudget = 0.0f;
                     
                     // Set type-specific budget
                     if (event.type == EventType::Birthday) {
@@ -4563,58 +3320,19 @@ int main()
                     }
                     
                     // Set up tasks
-                    currentEventTasks = event.tasks;
-                    UpdateDynamicTasks(currentEventTasks);
-                    taskDone = event.taskCompleted;
-                    if (taskDone.size() < currentEventTasks.size()) {
-                        taskDone.resize(currentEventTasks.size(), false);
+                    if (!event.tasks.empty()) {
+                        currentEventTasks = event.tasks;
+                        UpdateDynamicTasks(currentEventTasks);
+                        taskDone = event.taskCompleted;
                     }
-
-                    // Restore calendar tasks into the calendar state
-                    calendarState.tasks = event.calendarTasks;
-                    int maxTaskId = 0;
-                    for (const auto& task : calendarState.tasks) {
-                        maxTaskId = std::max(maxTaskId, task.id);
-                    }
-                    calendarState.lastTaskId = std::max(calendarState.lastTaskId, maxTaskId);
                     
                     currentScreen = SCREEN_DASHBOARD;
                 }
-
-                ImGui::SameLine();
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.95f, 0.35f, 0.42f, 1.0f));
-                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.0f, 0.5f, 0.6f, 1.0f));
-                ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.85f, 0.25f, 0.35f, 1.0f));
-                if (ImGui::Button("Delete", ImVec2(100, 40))) {
-                    deleteEventFile(event);
-                    currentEvent = nullptr;
-                    savedEvents.erase(savedEvents.begin() + i);
-                    ImGui::PopStyleColor(3);
-                    ImGui::PopID();
-                    continue;
-                }
-                ImGui::PopStyleColor(3);
-                ImGui::PopID();
-                ++i;
-            }
-            if (savedEvents.empty()) {
-                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.8f, 1.0f), "No saved events yet. Create one first to continue planning.");
             }
             
             ImGui::Separator();
             if (ImGui::Button("Back to Home", ImVec2(550, 40))) {
                 currentScreen = SCREEN_MAIN_MENU;
-            }
-            
-            ImGui::Spacing();
-            ImGui::SetCursorPosX((600 - 80) * 0.5f); // Center the small button
-            if (ImGui::Button("Logout", ImVec2(80, 25)))
-            {
-                currentUsername = "";
-                savedEvents.clear();
-                currentEvent = nullptr;
-                selectedEvent = EventType::None;
-                currentScreen = SCREEN_LOGIN;
             }
             
             ImGui::PopFont();
@@ -4648,13 +3366,13 @@ int main()
             ImGui::Separator();
             
             ImGui::Text("Event Name:");
-            ImGui::InputTextWithHint("##name", "e.g. My conf", eventName, IM_ARRAYSIZE(eventName));
+            ImGui::InputText("##name", eventName, IM_ARRAYSIZE(eventName));
             
             ImGui::Text("Date:");
-            ImGui::InputTextWithHint("##date", "MM-DD-YYYY", eventDate, IM_ARRAYSIZE(eventDate));
+            ImGui::InputText("##date", eventDate, IM_ARRAYSIZE(eventDate));
             
             ImGui::Text("Location:");
-            ImGui::InputTextWithHint("##location", "e.g. Cairo Conference Center", eventLocation, IM_ARRAYSIZE(eventLocation));
+            ImGui::InputText("##location", eventLocation, IM_ARRAYSIZE(eventLocation));
             
             ImGui::Text("Budget:");
             ImGui::InputFloat("##budget", &eventBudget, 100.0f, 1000.0f, "%.0f");
@@ -4672,29 +3390,15 @@ int main()
             }
             if (ImGui::Button("Create Event", ImVec2(450, 50)) && canCreate)
             {
-                bool isEditingExisting = (currentEvent != nullptr && currentEvent->type == selectedEvent);
+                // Create new event
                 Event newEvent;
-                if (isEditingExisting)
-                {
-                    currentEvent->name = eventName;
-                    currentEvent->date = eventDate;
-                    currentEvent->location = eventLocation;
-                    currentEvent->budget = eventBudget;
-                    currentEvent->guestList = eventGuests;
-                    currentEvent->notes = eventNotes;
-                    currentEvent->type = selectedEvent;
-                    newEvent = *currentEvent;
-                }
-                else
-                {
-                    newEvent.name = eventName;
-                    newEvent.date = eventDate;
-                    newEvent.location = eventLocation;
-                    newEvent.budget = eventBudget;
-                    newEvent.guestList = eventGuests;
-                    newEvent.notes = eventNotes;
-                    newEvent.type = selectedEvent;
-                }
+                newEvent.name = eventName;
+                newEvent.date = eventDate;
+                newEvent.location = eventLocation;
+                newEvent.budget = eventBudget;
+                newEvent.guestList = eventGuests;
+                newEvent.notes = eventNotes;
+                newEvent.type = selectedEvent;
                 
                 // Set selectedOption
                 if (selectedEvent == EventType::Birthday) {
@@ -4783,20 +3487,8 @@ int main()
                 }
                 newEvent.taskCompleted.assign(newEvent.tasks.size(), false);
                 
-                if (!isEditingExisting)
-                {
-                    savedEvents.push_back(newEvent);
-                    currentEvent = &savedEvents.back();
-                }
-                else
-                {
-                    std::string oldFilename = getEventFilename(*currentEvent);
-                    if (oldFilename != getEventFilename(newEvent))
-                    {
-                        deleteEventFile(*currentEvent);
-                    }
-                    *currentEvent = newEvent;
-                }
+                savedEvents.push_back(newEvent);
+                currentEvent = &savedEvents.back();
                 saveEvent(newEvent);
                 
                 // Set dashboard variables
@@ -4824,17 +3516,6 @@ int main()
             
             if (ImGui::Button("Back", ImVec2(450, 40))) {
                 currentScreen = SCREEN_EVENT_SELECTION;
-            }
-            
-            ImGui::Spacing();
-            ImGui::SetCursorPosX((500 - 80) * 0.5f); // Center the small button
-            if (ImGui::Button("Logout", ImVec2(80, 25)))
-            {
-                currentUsername = "";
-                savedEvents.clear();
-                currentEvent = nullptr;
-                selectedEvent = EventType::None;
-                currentScreen = SCREEN_LOGIN;
             }
             
             ImGui::PopFont();
